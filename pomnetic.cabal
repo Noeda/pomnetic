@@ -1,0 +1,45 @@
+cabal-version:      3.0
+name:               pomnetic
+version:            0.1.0.0
+synopsis:           Mikko's AI chaining thing
+homepage:           https://monoid.xyz/
+license:            ISC
+license-file:       LICENSE
+author:             Mikko Juola
+maintainer:         mikko.juola@iki.fi
+category:           Text
+build-type:         Simple
+extra-doc-files:    CHANGELOG.md
+
+common warnings
+    ghc-options: -Wall -fno-warn-name-shadowing -threaded -rtsopts
+
+library
+    import:           warnings
+    exposed-modules:  Pomnetic.Medium
+                      Pomnetic
+    build-depends:    base >=4.9 && <5.0
+                     ,containers
+                     ,primitive
+                     ,stm
+                     ,text
+                     ,vector
+    hs-source-dirs:   src
+    c-sources:        cbits/llama_glue.cc
+    -- extra-libraries:  llama, stdc++
+    extra-libraries:  llama, stdc++
+    -- frameworks:       Accelerate
+    default-language: Haskell2010
+
+executable pomnetic
+    import:           warnings
+    main-is:          Main.hs
+    build-depends:
+         async
+        ,base >=4.9 && <5.0
+        ,pomnetic
+        ,text
+        ,vector
+
+    hs-source-dirs:   exe
+    default-language: Haskell2010
