@@ -26,9 +26,10 @@ library
                      ,vector
     hs-source-dirs:   src
     c-sources:        cbits/llama_glue.cc
-    -- extra-libraries:  llama, stdc++
     extra-libraries:  llama, stdc++
-    -- frameworks:       Accelerate
+    -- llama wants Accelerate on macOS typically
+    if os(darwin)
+        frameworks:       Accelerate
     default-language: Haskell2010
 
 executable pomnetic
