@@ -6,25 +6,28 @@ import Control.Concurrent.Async
 import Data.Foldable
 import qualified Data.Text as T
 import Pomnetic
-import qualified Data.Vector as V
 
 main :: IO ()
 main = do
-  manager <- newManager "llama-2-7b-chat.Q6_K.gguf"
+  manager <- newManager "zephyr-7b-beta.Q6_K.gguf"
+    (setAfterGenWaitMs 500 $
+     setStartGenAfterNWaiters 5 defaultManagerSettings)
 
-  forConcurrently_ [1..50] $ \idx ->
+  forConcurrently_ [1..5] $ \idx ->
     withSession manager $ \session -> do
+      let gen20_tokens = generateConfig 20
+
       addText session $ T.pack $ "Hi, my name is Jacob and I like the number " <> show idx <> " for these reasons:"
-      generateText session 20
+      generateText session gen20_tokens
       txt <- wholeText session
       print (idx, txt)
-      generateText session 20
+      generateText session gen20_tokens
       txt <- wholeText session
       print (idx, txt)
       resetText session
 
       addText session $ T.pack $ "Hi, my name is Rachel"
-      generateText session 20
+      generateText session gen20_tokens
       txt <- wholeText session
       print (idx, txt)
       resetText session

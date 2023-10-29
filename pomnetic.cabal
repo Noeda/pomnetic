@@ -19,7 +19,9 @@ library
     exposed-modules:  Pomnetic.Medium
                       Pomnetic
     build-depends:    base >=4.9 && <5.0
+                     ,clock
                      ,containers
+                     ,mtl
                      ,primitive
                      ,stm
                      ,text

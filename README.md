@@ -18,41 +18,51 @@ import Control.Concurrent.Async
 import Data.Foldable
 import qualified Data.Text as T
 import Pomnetic
-import qualified Data.Vector as V
 
 main :: IO ()
 main = do
-  manager <- newManager "llama-2-7b-chat.Q6_K.gguf"
+  -- Create a manager, with settings as such:
+  -- To start text generation, wait at most 500ms for batch queues to become
+  -- full, OR until at least 5 threads are enqueued waiting for text
+  -- processing. (5 because we are going to spawn 5 threads, so we get about
+  -- the best batching we can).
+  manager <- newManager "zephyr-7b-beta.Q6_K.gguf"
+    (setAfterGenWaitMs 500 $
+     setStartGenAfterNWaiters 5 defaultManagerSettings)
 
-  -- spawn 50 threads, each with a separate text generation instance
-  forConcurrently_ [1..50] $ \idx ->
+  -- Spawn 5 threads, each generating text independently.
+  forConcurrently_ [1..5] $ \idx ->
     withSession manager $ \session -> do
-      -- One session = one independent text generation instance
+      -- Default generation config using mirostat; generate 20 tokens at a
+      -- time.
+      let gen20_tokens = generateConfig 20
 
-      -- Insert a prompt (session starts with empty prompt)
+      -- Add a prompt to the session. Sessions start with an empty text.
       addText session $ T.pack $ "Hi, my name is Jacob and I like the number " <> show idx <> " for these reasons:"
+      generateText session gen20_tokens
 
-      -- Generate 20 tokens
-      generateText session 20
-
-      -- Obtain the current text (will include the prompt + the 20 tokens)
+      -- Get the current text in the session (includes prompt + the 20
+      generated tokens)
       txt <- wholeText session
       print (idx, txt)
 
-      -- Generate 20 more tokens
-      generateText session 20
+      -- Do it again
+      generateText session gen20_tokens
       txt <- wholeText session
       print (idx, txt)
 
-      -- Empty all text from the session (so it's like if you started over)
+      -- Empty out the session (no text will remain, it's like starting over)
       resetText session
 
+      -- Start generating something else.
       addText session $ T.pack $ "Hi, my name is Rachel"
-      generateText session 20
+      generateText session gen20_tokens
       txt <- wholeText session
       print (idx, txt)
 
       resetText session
+
+      -- etc.
 ```
 
 

@@ -1,34 +1,92 @@
 --
 -- Medium-level bindings to llama.cpp
 --
+-- How to understand the process:
+--
+-- First, load a model with `loadModel`. llama.cpp takes `.gguf` files these
+-- days.
+--
+-- Then, create a context of that model with `createContext`.
+--
+-- You use contexts to generate text. `Context` has a lock on it, so using it
+-- from multiple threads will block one until one is done.
+--
+-- To generate text, you have to create batches. Use `createBatch` to make a
+-- batch. You give the batch a capacity, which will tell how many tokens it may
+-- contain at maximum. Batches start out empty (capacity and length are not the
+-- same thing).
+--
+-- Fill the batch with tokens using `setBatchItem`. These items may be from one
+-- or multiple independent text generation tasks. For the items you set their
+-- position ID, token ID and sequence ID they are from. You can use `tokenize`
+-- and other token functions to figure out which tokens to put in the items.
+-- For the last token you want to set `logits = True` for the batch item, which
+-- will instruct the system to predict probabilities for the token that would
+-- come after that token.
+--
+-- Use `processBatch` to instruct the system to process the batch. Afterwards,
+-- you can use `getLogits` to get probabilities for every token.
+--
+-- You can use `sampleMirostat` to sample a token from the logits. (or you can
+-- also do sampling yourself). For next generation, you could make a batch with
+-- just one item, the new token you just generated and set logits = True to
+-- predict next tokens. The context internally has a cache that remembers all
+-- previous tokens, so they don't need to be included in the batch again.
+--
+-- Use `forgetTokens` to alter what the context remembers about the tokens. You
+-- can use this to regenerate portion of the text, or just have the context
+-- forget your text entirely.
+--
 
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DeriveGeneric #-}
 
 module Pomnetic.Medium
-  ( Model()
-  , Context()
-  , PomneticError(..)
-  , Token()
-  , Batch()
-  , SeqID
-  , Logits
+  (
+  -- * Models
+    Model()
   , loadModel
+  -- * Contexts
+  , createContext
+  , Context()
+  , forgetTokens
+  -- * Errors
+  , PomneticError(..)
+  -- * Tokenization
+  , Token()
   , tokenize
   , bosToken
   , eosToken
   , tokenToText
-  , createContext
+  -- * Filtering
+  --
+  -- Filtering is used to constraint what output the LLM can generate.
+  , Filters()
+  , filtersFromTokenTexts
+  , andFilters
+  , orFilters
+  , banTokens
+  -- * Batching, and output
+  --
+  -- The key to efficient LLM text generation is batching.
+  , BatchItem(..)
+  , Batch()
   , createBatch
   , batchLength
   , setBatchItem
   , setBatchLength
+  , processBatch
+  , SeqID
+  -- * Sampling
+  , Logits
   , getLogits
-  , sampleMirostat
-  , decode
-  , removeTokens
-  , BatchItem(..)
-  , Logits )
+  -- ** Mirostat sampling
+  , MirostatConfig(..)
+  , mirostatConfig
+  , MirostatMu
+  , sampleMirostat )
   where
 
 import Control.Exception
@@ -36,11 +94,19 @@ import Control.Concurrent
 import Control.Monad
 import Control.Monad.IO.Class
 import Control.Monad.Primitive ( touch )
+import Data.IntSet ( IntSet )
+import qualified Data.IntSet as IS
 import Data.Data
+import Data.Foldable
 import Data.Int
+import Data.Set ( Set )
+import qualified Data.Set as S
+import Data.Word
+import GHC.Generics
 import Foreign.C.String
 import Foreign.Marshal.Alloc
 import Foreign.Marshal.Array
+import Foreign.Marshal.Utils
 import Foreign.ForeignPtr
 import Foreign.Ptr
 import Foreign.Storable
@@ -49,7 +115,6 @@ import Data.Text ( Text )
 import qualified Data.Text as T
 import Data.Vector ( Vector )
 import qualified Data.Vector as V
-import System.IO
 import System.IO.Unsafe
 
 foreign import ccall "hs_llama_load_model" c_llama_load_model :: CString -> IO (Ptr CModel)
@@ -85,13 +150,13 @@ foreign import ccall unsafe "hs_set_batch_length" c_llama_set_batch_length :: Pt
 foreign import ccall "hs_decode" c_llama_decode :: Ptr CContext -> Ptr CBatch -> IO CInt
 foreign import ccall unsafe "hs_get_logits" c_llama_get_logits :: Ptr CContext -> CInt -> Ptr CFloat -> IO ()
 foreign import ccall unsafe "hs_get_vocab_size" c_llama_vocab_size :: Ptr CContext -> IO CInt
-foreign import ccall "hs_sample_mirostat" c_llama_sample_mirostat :: Ptr CContext -> Ptr CFloat -> Ptr CFloat -> IO Int32
+foreign import ccall "hs_sample_mirostat" c_llama_sample_mirostat :: Ptr CContext -> Ptr CFloat -> Ptr CFloat -> Ptr Word8 -> CFloat -> CFloat -> IO Int32
 
 foreign import ccall "hs_remove_tokens" c_llama_remove_tokens :: Ptr CContext -> CInt -> CInt -> CInt -> IO ()
 
 -- Match with llama.cpp
 newtype Token = Token Int32
-  deriving ( Eq, Ord, Show, Typeable, Storable )
+  deriving ( Eq, Ord, Show, Data, Typeable, Storable, Generic )
 
 newtype Batch = Batch (ForeignPtr CBatch)
   deriving ( Eq, Ord, Show )
@@ -109,7 +174,7 @@ newtype Model = Model (ForeignPtr CModel)
 data PomneticError
   = PomneticError String
   | TooLongText
-  deriving ( Eq, Ord, Show, Typeable )
+  deriving ( Eq, Ord, Show, Data, Typeable, Generic )
 
 instance Exception PomneticError
 
@@ -173,6 +238,17 @@ createBatch sz = liftIO $ mask_ $ do
 
 type SeqID = Int
 
+-- | One item, to be sent to batch.
+--
+-- `position` tells at which position the item is in the sequence.
+--
+-- `sequenceId` tells which independent sequence the batch belongs to. The
+-- batches can compute multiple independent text generations at once, and the
+-- sequence ID is used to distinguish them.
+--
+-- If `logits` is True, then a prediction is made for the token that should
+-- come after this item, and you can use `getLogits` to get the predictions
+-- (matching the index at which the BatchItem is in the batch).
 data BatchItem = BatchItem
   { token :: !Token
   , position :: !Int
@@ -180,8 +256,12 @@ data BatchItem = BatchItem
   , logits :: !Bool }
   deriving ( Eq, Ord, Show )
 
-decode :: MonadIO m => Context -> Batch -> m ()
-decode ctx (Batch fptr_batch) = liftIO $ withForeignPtr fptr_batch $ \ptr -> do
+-- | Computes a batch.
+--
+-- Use `getLogits` to get the logits of a batch, with index matching which
+-- index you used in `setBatchItem`.
+processBatch :: MonadIO m => Context -> Batch -> m ()
+processBatch ctx (Batch fptr_batch) = liftIO $ withForeignPtr fptr_batch $ \ptr -> do
   withContext ctx $ \ctx_ptr -> do
     result <- c_llama_decode ctx_ptr ptr
     when (result > 0) $
@@ -190,8 +270,16 @@ decode ctx (Batch fptr_batch) = liftIO $ withForeignPtr fptr_batch $ \ptr -> do
     when (result < 0) $
       pomneticError "Failed to decode"
 
-removeTokens :: MonadIO m => Context -> SeqID -> Int -> Int -> m ()
-removeTokens ctx seq_id start end = liftIO $ withContext ctx $ \ctx_ptr ->
+-- | Makes the context forget tokens in the given range, for the given
+-- sequence.
+--
+-- The range includes the item at given start index, but not the one in end
+-- index. I.e. [start, end).
+--
+-- This understands negative indexes. For example, start=0 and end=-1 will
+-- forget all tokens for a sequence.
+forgetTokens :: MonadIO m => Context -> SeqID -> Int -> Int -> m ()
+forgetTokens ctx seq_id start end = liftIO $ withContext ctx $ \ctx_ptr ->
   c_llama_remove_tokens ctx_ptr (fromIntegral seq_id) (fromIntegral start) (fromIntegral end)
 
 setBatchItem :: Batch -> BatchItem -> Int -> IO ()
@@ -240,19 +328,90 @@ getLogits ctx idx =
       c_llama_get_logits ctx_ptr (fromIntegral idx) logits_ptr
       V.fromList . fmap cfloatToFloat <$> peekArray (vocabSize ctx) logits_ptr
 
-type Mu = Float
+data Filters
+  = NoFilter
+  | AndFilter Filters Filters
+  | OrFilter Filters Filters
+  | BanTokens !IntSet
+  deriving ( Eq, Ord, Show, Read, Data, Typeable, Generic )
 
-sampleMirostat :: MonadIO m => Context -> Logits -> Mu -> m (Token, Mu)
-sampleMirostat ctx logits _mu | V.length logits /= vocabSize ctx =
+banTokens :: Set Token -> Filters
+banTokens tokens = BanTokens $ IS.fromList $ fmap (\(Token tk) -> fromIntegral tk) $ S.toList tokens
+
+andFilters :: [Filters] -> Filters
+andFilters [f1] = f1
+andFilters [] = NoFilter
+andFilters filters = foldl1 AndFilter filters
+
+orFilters :: [Filters] -> Filters
+orFilters = foldr OrFilter NoFilter
+
+-- | Calls the given function with every token, and builds a blacklist based on
+-- it.
+--
+-- Returning True means the token is allowed.
+filtersFromTokenTexts :: Context -> (Text -> Bool) -> Filters
+filtersFromTokenTexts ctx@(Context _ model _) action =
+  let iset = foldl' folder IS.empty [0..vocabSize ctx-1]
+   in if IS.null iset
+        then NoFilter
+        else BanTokens iset
+ where
+  folder iset' idx =
+    let tk = Token (fromIntegral idx)
+     in if not $ action $ tokenToText model tk
+          then IS.insert idx iset'
+          else iset'
+
+instance Monoid Filters where
+  mempty = NoFilter
+  mappend NoFilter f2 = f2
+  mappend f1 NoFilter = f1
+  mappend f1 f2 = OrFilter f1 f2
+
+instance Semigroup Filters where
+  f1 <> f2 = mappend f1 f2
+
+type MirostatMu = Float
+
+data MirostatConfig = MirostatConfig
+  { mirostatTau :: !Float
+  , mirostatEta :: !Float }
+  deriving ( Eq, Ord, Show, Read, Data, Typeable, Generic )
+
+mirostatConfig :: Float -> Float -> MirostatConfig
+mirostatConfig tau eta = MirostatConfig tau eta
+
+sampleMirostat :: MonadIO m => Context -> Logits -> MirostatMu -> Filters -> MirostatConfig -> m (Token, MirostatMu)
+sampleMirostat ctx logits _mu _filters _config | V.length logits /= vocabSize ctx =
   pomneticError "Logits size must be equal to vocab size"
-sampleMirostat ctx logits mu = liftIO $ withContext ctx $ \ctx_ptr ->
+sampleMirostat ctx@(Context _ _ vocab_size) logits mu filters config = liftIO $ withContext ctx $ \ctx_ptr ->
   allocaArray (V.length logits) $ \logits_ptr -> do
     pokeArray logits_ptr (fmap realToFrac $ V.toList logits)
     alloca $ \mu_ptr -> do
-      poke mu_ptr (CFloat mu)
-      token_idx <- c_llama_sample_mirostat ctx_ptr logits_ptr mu_ptr
-      new_mu <- cfloatToFloat <$> peek mu_ptr
-      return (Token $ fromIntegral token_idx, new_mu)
+      allocaArray (V.length logits) $ \blacklist_ptr -> do
+        fillBlacklist filters blacklist_ptr vocab_size
+        poke mu_ptr (CFloat mu)
+        token_idx <- c_llama_sample_mirostat ctx_ptr logits_ptr mu_ptr blacklist_ptr (CFloat (mirostatTau config)) (CFloat (mirostatEta config))
+        new_mu <- cfloatToFloat <$> peek mu_ptr
+        return (Token $ fromIntegral token_idx, new_mu)
+
+fillBlacklist :: Filters -> Ptr Word8 -> Int -> IO ()
+fillBlacklist filters ptr vocab_size = do
+  fillBytes ptr 0 vocab_size
+  for_ (IS.toList banlist) $ \idx ->
+    when (idx < vocab_size) $
+      pokeElemOff ptr idx 1
+ where
+  banlist = go filters
+
+  go NoFilter = IS.empty
+  go (AndFilter f1 f2) =
+    go f1 `IS.intersection` go f2
+  go (OrFilter f1 f2) =
+    go f1 `IS.union` go f2
+  go (BanTokens tokens) =
+    tokens `IS.union` banlist
 
 cfloatToFloat :: CFloat -> Float
 cfloatToFloat = realToFrac

@@ -150,7 +150,7 @@ void hs_get_logits(llama_context* ctx, int idx, float* logits) {
     memcpy(logits, l, sizeof(float) * hs_get_vocab_size(ctx));
 }
 
-int32_t hs_sample_mirostat(llama_context* ctx, float* logits, float* mu) {
+int32_t hs_sample_mirostat(llama_context* ctx, float* logits, float* mu, uint8_t* blacklist, float tau, float eta) {
     llama_token_data_array arr;
     memset(&arr, 0, sizeof(arr));
     int vocab_size = hs_get_vocab_size(ctx);
@@ -160,18 +160,22 @@ int32_t hs_sample_mirostat(llama_context* ctx, float* logits, float* mu) {
         abort();
     }
 
-    arr.size = vocab_size;
+    arr.size = 0;
     arr.sorted = false;
 
+    int arr_cursor = 0;
     for (int i1 = 0; i1 < vocab_size; ++i1) {
-        arr.data[i1].id = i1;
-        arr.data[i1].logit = logits[i1];
-        arr.data[i1].p = 0.0;
+        if (blacklist && blacklist[i1]) {
+            continue;
+        }
+        arr.data[arr_cursor].id = i1;
+        arr.data[arr_cursor].logit = logits[i1];
+        arr.data[arr_cursor].p = 0.0;
+        arr_cursor++;
+        arr.size++;
     }
 
-    //int32_t result = llama_sample_token_mirostat_v2(ctx, &arr, 4.0, 0.1, mu);
-    //printf("mu=%g\n", *mu);
-    int32_t result = llama_sample_token_greedy(ctx, &arr);
+    int32_t result = llama_sample_token_mirostat_v2(ctx, &arr, tau, eta, mu);
     free(arr.data);
 
     return result;

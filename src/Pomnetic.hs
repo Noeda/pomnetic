@@ -1,15 +1,52 @@
+-- | High-level bindings to llama.cpp
+--
+-- This is a higher level API to llama.cpp text generation.
+--
+-- There is a more low-level API in Pomnetic.Medium, and this module is built
+-- on top of that layer.
+--
+-- Designed to be easy to use from multiple Haskell threads; if you use the
+-- same `Manager` from multiple threads, this will, behind the scenes, try to
+-- batch your generation tasks in efficient bundles.
+--
+
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE LambdaCase #-}
 
 module Pomnetic
   ( newManager
+  , Manager()
+  , ManagerSettings()
+  , defaultManagerSettings
+  , enableDebugLog
+  , setAfterGenWaitMs
+  , afterGenWaitMs
+  , startGenAfterNWaiters
+  , setStartGenAfterNWaiters
   , PomneticError(..)
   , withSession
   , wholeText
   , addText
   , resetText
-  , generateText )
+  , generateText
+  -- * Generation configuration
+  , GenerateConfig(..)
+  , generateConfig
+  , Sampler(..)
+  -- ** Filters
+  , Filters()
+  , andFilters
+  , orFilters
+  , banTokens
+  , filtersFromTokenTexts
+  -- ** Mirostat
+  , MirostatConfig(..)
+  , mirostatConfig
+  , mirostat4
+  , MirostatMu )
   where
 
 import Control.Concurrent
@@ -17,6 +54,7 @@ import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
+import Control.Monad.State.Strict
 import Data.Foldable
 import Data.Data
 import Data.IORef
@@ -27,8 +65,11 @@ import qualified Data.Sequence as SQ
 import Data.Text ( Text )
 import Data.Vector ( Vector )
 import qualified Data.Vector as V
+import GHC.Generics
 import Pomnetic.Medium
+import System.Clock
 import System.IO
+import System.Timeout
 
 data Manager = Manager
   { cmModel :: !Model
@@ -38,6 +79,9 @@ data Manager = Manager
 
 data Work = Predict !SeqID !Int ((BatchItem -> IO Int) -> IO ()) (Context -> Batch -> IO ()) (IO ())
   --                 seq_id sz     lay out the items               -- called on result        reset
+
+workSeqID :: Work -> SeqID
+workSeqID (Predict seq_id _ _ _ _) = seq_id
 
 workSize :: Work -> Int
 workSize (Predict _ sz _ _ _) = sz
@@ -56,14 +100,70 @@ data KillSilently = KillSilently
 
 instance Exception KillSilently
 
-newManager :: MonadIO m => FilePath -> m Manager
-newManager fpath = liftIO $ mask_ $ do
+type UseDebugLog = Bool
+
+-- | Settings for a manager.
+data ManagerSettings = ManagerSettings
+  { debugLog :: !UseDebugLog
+  , afterGenWaitMs :: !Integer
+  , startGenAfterNWaiters :: !Integer }
+  deriving ( Eq, Ord, Show, Read, Typeable, Data, Generic )
+
+defaultManagerSettings :: ManagerSettings
+defaultManagerSettings = ManagerSettings
+  { debugLog = False
+  , startGenAfterNWaiters = 0
+  , afterGenWaitMs = 0 }
+
+-- | Enables debug log. This will make the manager write to stderr about
+-- everything that happens. Noisy.
+enableDebugLog :: ManagerSettings -> ManagerSettings
+enableDebugLog settings = settings { debugLog = True }
+
+-- | Sets a wait time in milliseconds after genereating some tokens.
+--
+-- By default this is 0. Why would you want to add a delay? The reason is that
+-- if you have multiple threads, all vying for their turn to generate text,
+-- instantly picking up new work and processing it will most likely not get
+-- every thread on board, and some of them will wait. A tiny delay (e.g. 5ms)
+-- is often already enough to mitigate this.
+--
+-- If `startGenAfterNWaiters` is also set, then that can trigger generation
+-- earlier.
+setAfterGenWaitMs :: Integer -> ManagerSettings -> ManagerSettings
+setAfterGenWaitMs ms settings = settings { afterGenWaitMs = ms }
+
+-- | Sets a threshold that if reached, the manager will start processing tokens.
+--
+-- This is used with `setAfterGenWaitMs`. For example, if you know that you
+-- have 5 active threads trying to generate text, you can set this threshold to
+-- 5 and as soon as those 5 threads have submitted a request to generate text,
+-- the processing begins, rather than waiting until the time limit set in
+-- `setAfterGenWaitMs`.
+--
+-- Has no effect if `setAfterGenWaitMs` is not also set.
+--
+-- The default is 0, which will turn this feature off; making the generator
+-- always wait until `setAfterGenWaitMs`.
+setStartGenAfterNWaiters :: Integer -> ManagerSettings -> ManagerSettings
+setStartGenAfterNWaiters n settings = settings { startGenAfterNWaiters = n }
+
+-- | Creates a new manager.
+--
+-- One manager handles one or more sessions generating text, batching their
+-- text generation in an efficient way behind the scenes if they are generating
+-- text at the same time from multiple threads.
+newManager :: MonadIO m => FilePath -> ManagerSettings -> m Manager
+newManager fpath manager_settings = liftIO $ mask_ $ do
   model <- loadModel fpath
   ctx <- createContext model
   work <- newTVarIO SQ.empty
 
   tid <- forkIOWithUnmask $ \unmask -> unmask $ do
     result <- try $ worker model ctx work
+                      (debugLog manager_settings)
+                      (afterGenWaitMs manager_settings)
+                      (startGenAfterNWaiters manager_settings)
     case result of
       Left KillSilently -> return ()
       Right () -> error "impossible"
@@ -73,18 +173,30 @@ newManager fpath = liftIO $ mask_ $ do
   available_seq_idxs <- newTVarIO $ IS.fromList [0..99]
   return $ Manager model ctx available_seq_idxs work
 
-worker :: Model -> Context -> TVar (SQ.Seq Work) -> IO ()
-worker model ctx work_queue = forever $ do
+worker :: Model -> Context -> TVar (SQ.Seq Work) -> UseDebugLog -> Integer -> Integer -> IO ()
+worker model
+       ctx
+       work_queue
+       use_debug_log
+       after_gen_wait_ms
+       start_gen_after_n_waiters = forever $ do
   work_items <- atomically $ do
     seq <- readTVar work_queue
     when (SQ.null seq) retry
     writeTVar work_queue SQ.empty
     return seq
 
-  handleWorkItems model ctx (toList work_items)
+  handleWorkItems model ctx (toList work_items) use_debug_log
+  unless (null work_items) $
+    when (after_gen_wait_ms > 0) $
+      if start_gen_after_n_waiters == 0
+        then threadDelay $ fromIntegral after_gen_wait_ms * 1000
+        else void $ timeout (fromIntegral after_gen_wait_ms * 1000) $ atomically $ do
+            works <- readTVar work_queue
+            unless (SQ.length works >= fromIntegral start_gen_after_n_waiters) retry
 
-handleWorkItems :: Model -> Context -> [Work] -> IO ()
-handleWorkItems _model ctx works = do
+handleWorkItems :: Model -> Context -> [Work] -> UseDebugLog -> IO ()
+handleWorkItems _model ctx works use_debug_log = do
   let num_items = sum $ fmap workSize works
   if num_items == 0
     then return ()
@@ -95,15 +207,27 @@ handleWorkItems _model ctx works = do
     setBatchLength batch num_items
 
     go2 batch 0 works
-    result <- try $ decode ctx batch
+    start <- getTime Monotonic
+    when use_debug_log $ do
+      -- Count different number of sequences
+      let n_seq_ids = IS.size $ flip execState IS.empty $ for_ works $ \work ->
+                        modify $ IS.insert (workSeqID work)
+      hPutStrLn stderr $ "processBatch called with length=" <> show num_items <> " and n_seq_ids=" <> show n_seq_ids
+    result <- try $ processBatch ctx batch
+    end <- getTime Monotonic
+    when use_debug_log $ do
+      let nanosecs = toNanoSecs $ diffTimeSpec end start
+          per_item = nanosecs `div` (fromIntegral num_items)
+      hPutStrLn stderr $ "processBatch finished: " <> show (fromIntegral nanosecs / 1000000000 :: Double) <> " seconds (" <> show (fromIntegral per_item / 1000000000 :: Double) <> " per item)"
     case result of
       Left (PomneticError msg) -> throwIO $ PomneticError msg
       Left TooLongText | length works > 1 -> do
-        hPutStrLn stderr "Needing to break up batches..."
+        when use_debug_log $
+          hPutStrLn stderr $ "Received TooLongText exception, batch size " <> show num_items <> " will try again by splitting into two."
         for_ works $ \work ->
           workReset work
-        handleWorkItems _model ctx (take (length works `div` 2) works)
-        handleWorkItems _model ctx (drop (length works `div` 2) works)
+        handleWorkItems _model ctx (take (length works `div` 2) works) use_debug_log
+        handleWorkItems _model ctx (drop (length works `div` 2) works) use_debug_log
       Left TooLongText -> throwIO TooLongText
       Right () -> for_ works $ \work ->
         workResulter work ctx batch
@@ -129,6 +253,7 @@ withSeqIdx manager action = mask $ \restore -> do
   finally (restore $ action seq_idx) $ do
     atomically $ modifyTVar (cmAvailableSeqIdxs manager) (IS.insert seq_idx)
 
+-- | One session of text generation.
 data Session = Session
   { posRef :: !(IORef Int)
   , nextTokenRef :: !(IORef Int)
@@ -139,9 +264,14 @@ data Session = Session
   , sessionManager :: !Manager
   , sessionSeqIdx :: !Int }
 
+-- | Creates a new session, runs code inside the session, and then cleans up
+-- the session.
+--
+-- Bad things may happen if you keep the `Session` value after `withSession` is
+-- over. Only use it inside its own `withSession`.
 withSession :: MonadIO m => Manager -> (Session -> IO a) -> m a
 withSession manager action = liftIO $ withSeqIdx manager $ \seq_idx -> do
-  removeTokens (cmContext manager) seq_idx 0 (-1)
+  forgetTokens (cmContext manager) seq_idx 0 (-1)
 
   pos_ref <- newIORef 0
   next_token_ref <- newIORef 0
@@ -165,10 +295,11 @@ withSession manager action = liftIO $ withSeqIdx manager $ \seq_idx -> do
 
   result <- action session
 
-  removeTokens (cmContext manager) seq_idx 0 (-1)
+  forgetTokens (cmContext manager) seq_idx 0 (-1)
 
   return result
 
+-- | Returns the current text in the session.
 wholeText :: MonadIO m => Session -> m Text
 wholeText session = liftIO $ do
   applyWantedTokens session
@@ -179,9 +310,29 @@ wholeText session = liftIO $ do
 
   return txt
 
-generateText :: MonadIO m => Session -> Int -> m ()
-generateText _ 0 = return ()
-generateText session max_tokens = liftIO $ do
+data GenerateConfig = GenerateConfig
+  { numTokens :: !Int
+  , filters :: !Filters
+  , sampler :: !Sampler }
+  deriving ( Eq, Ord, Show, Read, Typeable, Data, Generic )
+
+data Sampler
+  = Mirostat !MirostatConfig
+  deriving ( Eq, Ord, Show, Read, Typeable, Data, Generic )
+
+-- | Generation config with mirostat4 as the sampler and no filters.
+--
+-- Generates N tokens.
+generateConfig :: Int -> GenerateConfig
+generateConfig ntokens = GenerateConfig
+  { numTokens = ntokens
+  , filters = mempty
+  , sampler = Mirostat mirostat4 }
+
+-- | Generates N amount of tokens to the session.
+generateText :: MonadIO m => Session -> GenerateConfig -> m ()
+generateText _ config | numTokens config == 0 = return ()
+generateText session config = liftIO $ do
   applyWantedTokens session
 
   let seq_idx = sessionSeqIdx session
@@ -190,7 +341,9 @@ generateText session max_tokens = liftIO $ do
   logits <- fmap fromJust $ atomically $ readTVar (logitsTVar session)
 
   mu <- readIORef (sessionMu session)
-  (new_token, new_mu) <- sampleMirostat (cmContext $ sessionManager session) logits mu
+  (new_token, new_mu) <- case sampler config of
+    Mirostat mirostat_config ->
+      sampleMirostat (cmContext $ sessionManager session) logits mu mempty mirostat_config
   writeIORef (sessionMu session) new_mu
 
   modifyIORef' (generatedTokens session) $ \vec -> vec <> V.singleton new_token
@@ -227,7 +380,7 @@ generateText session max_tokens = liftIO $ do
     Nothing -> retry
     Just _logits -> return ()
 
-  generateText session (max_tokens-1)
+  generateText session (config { numTokens = numTokens config - 1 })
 
 applyWantedTokens :: Session -> IO ()
 applyWantedTokens session = do
@@ -235,7 +388,7 @@ applyWantedTokens session = do
   wanted_vec <- readIORef (wantedTokens session)
 
   if | V.length gen_vec > V.length wanted_vec -> do
-         removeTokens ctx seq_idx (V.length wanted_vec-1) (-1)
+         forgetTokens ctx seq_idx (V.length wanted_vec-1) (-1)
          writeIORef (generatedTokens session) (V.take (V.length wanted_vec-1) gen_vec)
          writeIORef (posRef session) (V.length wanted_vec-1)
          applyWantedTokens session
@@ -245,7 +398,7 @@ applyWantedTokens session = do
          len <- commonPrefixLen gen_vec wanted_vec 0
          if len == V.length wanted_vec
            then return ()  -- same prefixes
-           else do removeTokens ctx seq_idx len (-1)
+           else do forgetTokens ctx seq_idx len (-1)
                    writeIORef (generatedTokens session) (V.take len gen_vec)
                    decodeWantedTokens (V.drop len wanted_vec)
  where
@@ -295,13 +448,22 @@ applyWantedTokens session = do
     w <- readIORef $ wantedTokens session
     writeIORef (generatedTokens session) w
 
+-- | Adds text to the end of the current session.
 addText :: MonadIO m => Session -> Text -> m ()
 addText session text = liftIO $ do
   let model = cmModel (sessionManager session)
       new_tokens = tokenize model text
   modifyIORef' (wantedTokens session) (<> new_tokens)
 
+-- | Erases all text from the session.
 resetText :: MonadIO m => Session -> m ()
 resetText session = liftIO $ do
   let bos = bosToken (cmContext $ sessionManager session)
   writeIORef (wantedTokens session) (V.singleton bos)
+
+-- | Mirostat sampling with tau = 4 and eta = 0.05
+mirostat4 :: MirostatConfig
+mirostat4 = MirostatConfig
+  { mirostatTau = 4.0
+  , mirostatEta = 0.05
+  }
