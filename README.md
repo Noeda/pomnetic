@@ -9,6 +9,11 @@ You can write code with dozens of instances of text generation from Haskell
 threads and it'll do its best to transparently batch them together and run them
 efficiently.
 
+It also supports attoparsec and regex-tdfa filters on the output; only tokens
+that either match a regex or pass an attoparsec parser are accepted. This can
+be used to do things like e.g. only accept valid JSON-formatted output from an
+LLM model (with some caveats).
+
 ```haskell
 {-# LANGUAGE OverloadedStrings #-}
 
