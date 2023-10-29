@@ -44,6 +44,8 @@ module Pomnetic
   , andFilters
   , orFilters
   , regexFilter
+  , attoparsecFilter
+  , attoparsecBSFilter
   -- ** Mirostat
   , MirostatConfig(..)
   , mirostatConfig
@@ -331,7 +333,7 @@ data GenerateConfig = GenerateConfig
   { numTokens :: !Int
   , filters :: !Filters
   , sampler :: !Sampler }
-  deriving ( Eq, Ord, Show, Read, Typeable, Data, Generic )
+  deriving ( Typeable, Generic )
 
 data Sampler
   = Mirostat !MirostatConfig
@@ -348,14 +350,19 @@ generateConfig ntokens = GenerateConfig
 
 -- | Generates N amount of tokens to the session.
 generateText :: MonadIO m => Session -> GenerateConfig -> m ()
-generateText _ config | numTokens config == 0 = return ()
 generateText session config = liftIO $ do
+  applyWantedTokens session
+  n_tokens_generated <- fmap V.length $ readIORef (generatedTokens session)
+  generateText2 session config n_tokens_generated
+
+generateText2 :: Session -> GenerateConfig -> Int -> IO ()
+generateText2 _ config _ | numTokens config == 0 = return ()
+generateText2 session config n_tokens_generated = liftIO $ do
   applyWantedTokens session
 
   let seq_idx = sessionSeqIdx session
       manager = sessionManager session
 
-  n_tokens_generated <- fmap V.length $ readIORef (generatedTokens session)
   regex_filter_text <- textFrom session n_tokens_generated
 
   logits <- fmap fromJust $ atomically $ readTVar (logitsTVar session)
@@ -406,7 +413,7 @@ generateText session config = liftIO $ do
     Nothing -> retry
     Just _logits -> return ()
 
-  generateText session (config { numTokens = numTokens config - 1 })
+  generateText2 session (config { numTokens = numTokens config - 1 }) n_tokens_generated
 
 applyWantedTokens :: Session -> IO ()
 applyWantedTokens session = do

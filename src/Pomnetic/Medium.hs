@@ -68,6 +68,8 @@ module Pomnetic.Medium
   , orFilters
   , regexFilter
   , RegexFilterText
+  , attoparsecFilter
+  , attoparsecBSFilter
   -- * Batching, and output
   --
   -- The key to efficient LLM text generation is batching.
@@ -106,8 +108,11 @@ import Foreign.ForeignPtr
 import Foreign.Ptr
 import Foreign.Storable
 import Foreign.C.Types
+import Data.Attoparsec.Text
+import qualified Data.Attoparsec.ByteString as B
 import Data.Text ( Text )
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import Data.Vector ( Vector )
 import qualified Data.Vector as V
 import Pomnetic.Error
@@ -327,7 +332,9 @@ data Filters
   | AndFilter Filters Filters
   | OrFilter Filters Filters
   | RegexFilter !Text
-  deriving ( Eq, Ord, Show, Read, Data, Typeable, Generic )
+  | AttoparsecFilter !(Parser ())
+  | AttoparsecBSFilter !(B.Parser ())
+  deriving ( Typeable, Generic )
 
 andFilters :: [Filters] -> Filters
 andFilters [f1] = f1
@@ -346,6 +353,9 @@ orFilters = foldr OrFilter NoFilter
 -- to be generated" does not work, because partial matches are not accepted,
 -- and the models cannot generate that string in one token.
 --
+-- You may want to use `attoparsecFilter` instead, that can deal with partially
+-- matching input.
+--
 -- You can however use it to specify character ranges, e.g. "^[^a]*$" will
 -- accept text generation that never uses the letter 'a'.
 --
@@ -354,6 +364,18 @@ orFilters = foldr OrFilter NoFilter
 -- The regex uses `regex-tdfa` package.
 regexFilter :: Text -> Filters
 regexFilter regex = RegexFilter regex
+
+-- | Adds a filter that runs an attoparsec. If the parser does not fail, then
+-- the token is accepted. Only unambiguous fail is a fail; incomplete input is
+-- not considered a fail.
+attoparsecFilter :: Parser () -> Filters
+attoparsecFilter parser = AttoparsecFilter parser
+
+-- | Same as `attoparsecFilter` but takes bytestrings instead of Text.
+--
+-- Internally, the output is converted to UTF-8 and then passed as bytestring.
+attoparsecBSFilter :: B.Parser () -> Filters
+attoparsecBSFilter parser = AttoparsecBSFilter parser
 
 -- | Used in sampling functions to pass in already generated text (to be used
 -- with the `regexFilter`).
@@ -430,13 +452,41 @@ fillBlacklist filters ptr vocab_size model regex_filter_text = do
 
   go :: Filters -> IO [Token -> IO Bool]
   go NoFilter = return []
+  go (AttoparsecFilter parser) = do
+    return [\token ->
+      let token_str = tokenToText model token
+          whole = regex_filter_text <> token_str
+       in do case parse parser whole of
+               Fail {} -> return False
+               Done {} -> return True
+               Partial {} ->
+                 -- reject empty tokens for partial matches; prevents the model
+                 -- from repeatedly generating an empty token to technically
+                 -- adhere to the parser.
+                 if T.null token_str
+                   then return False
+                   else return True]
+  go (AttoparsecBSFilter parser) = do
+    return [\token ->
+      let token_str = tokenToText model token
+          whole = T.encodeUtf8 $ regex_filter_text <> token_str
+       in do case B.parse parser whole of
+               Fail {} -> return False
+               Done {} -> return True
+               Partial {} ->
+                 -- reject empty tokens for partial matches; prevents the model
+                 -- from repeatedly generating an empty token to technically
+                 -- adhere to the parser.
+                 if T.null token_str
+                   then return False
+                   else return True]
   go (RegexFilter regex) = do
     compiled_regex <- case compile defaultCompOpt defaultExecOpt regex of
       Left err -> throwIO $ InvalidRegex (T.pack err)
       Right compiled -> return compiled
     return [\token ->
        let whole = regex_filter_text <> tokenToText model token
-        in return $ match compiled_regex whole]
+        in return $ Text.Regex.Base.RegexLike.match compiled_regex whole]
 
   go (AndFilter f1 f2) = do
     f1s <- go f1

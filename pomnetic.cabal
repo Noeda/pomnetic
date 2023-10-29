@@ -19,7 +19,8 @@ library
     exposed-modules:  Pomnetic.Error
                       Pomnetic.Medium
                       Pomnetic
-    build-depends:    base >=4.9 && <5.0
+    build-depends:    attoparsec
+                     ,base >=4.9 && <5.0
                      ,clock
                      ,containers
                      ,mtl
@@ -42,6 +43,8 @@ executable pomnetic
     main-is:          Main.hs
     build-depends:
          async
+        ,attoparsec
+        ,attoparsec-aeson
         ,base >=4.9 && <5.0
         ,pomnetic
         ,text
