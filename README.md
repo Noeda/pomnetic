@@ -42,7 +42,7 @@ main = do
       generateText session gen20_tokens
 
       -- Get the current text in the session (includes prompt + the 20
-      generated tokens)
+      -- generated tokens)
       txt <- wholeText session
       print (idx, txt)
 
