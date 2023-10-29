@@ -31,6 +31,7 @@ module Pomnetic
   , sessionContext
   , sessionModel
   , wholeText
+  , textFrom
   , addText
   , resetText
   , generateText
@@ -42,8 +43,7 @@ module Pomnetic
   , Filters()
   , andFilters
   , orFilters
-  , banTokens
-  , filtersFromTokenTexts
+  , regexFilter
   -- ** Mirostat
   , MirostatConfig(..)
   , mirostatConfig
@@ -231,6 +231,7 @@ handleWorkItems _model ctx works use_debug_log = do
         handleWorkItems _model ctx (take (length works `div` 2) works) use_debug_log
         handleWorkItems _model ctx (drop (length works `div` 2) works) use_debug_log
       Left TooLongText -> throwIO TooLongText
+      Left other -> throwIO other
       Right () -> for_ works $ \work ->
         workResulter work ctx batch
    where
@@ -258,7 +259,6 @@ withSeqIdx manager action = mask $ \restore -> do
 -- | One session of text generation.
 data Session = Session
   { posRef :: !(IORef Int)
-  , nextTokenRef :: !(IORef Int)
   , sessionMu :: !(IORef Float)
   , generatedTokens :: !(IORef (Vector Token))
   , wantedTokens :: !(IORef (Vector Token))
@@ -282,7 +282,6 @@ withSession manager action = liftIO $ withSeqIdx manager $ \seq_idx -> do
   forgetTokens (cmContext manager) seq_idx 0 (-1)
 
   pos_ref <- newIORef 0
-  next_token_ref <- newIORef 0
 
   mu_ref <- newIORef 8.0
   logits_tvar <- newTVarIO Nothing
@@ -293,7 +292,6 @@ withSession manager action = liftIO $ withSeqIdx manager $ \seq_idx -> do
   wanted_ref <- newIORef $ V.singleton bos
 
   let session = Session { posRef = pos_ref
-                        , nextTokenRef = next_token_ref
                         , sessionMu = mu_ref
                         , generatedTokens = gen_ref
                         , wantedTokens = wanted_ref
@@ -315,6 +313,17 @@ wholeText session = liftIO $ do
 
   let model = cmModel (sessionManager session)
   let txt = mconcat $ fmap (tokenToText model) (V.toList tokens)
+
+  return txt
+
+-- | Returns text starting from a certain index (in tokens).
+textFrom :: MonadIO m => Session -> Int -> m Text
+textFrom session start = liftIO $ do
+  applyWantedTokens session
+  tokens <- readIORef (generatedTokens session)
+
+  let model = cmModel (sessionManager session)
+  let txt = mconcat $ fmap (tokenToText model) (V.toList $ V.drop start tokens)
 
   return txt
 
@@ -346,12 +355,21 @@ generateText session config = liftIO $ do
   let seq_idx = sessionSeqIdx session
       manager = sessionManager session
 
+  n_tokens_generated <- fmap V.length $ readIORef (generatedTokens session)
+  regex_filter_text <- textFrom session n_tokens_generated
+
   logits <- fmap fromJust $ atomically $ readTVar (logitsTVar session)
 
   mu <- readIORef (sessionMu session)
   (new_token, new_mu) <- case sampler config of
     Mirostat mirostat_config ->
-      sampleMirostat (cmContext $ sessionManager session) logits mu (filters config) mirostat_config
+      sampleMirostat (cmContext $ sessionManager session)
+                     logits
+                     mu
+                     (filters config)
+                     mirostat_config
+                     regex_filter_text
+
   writeIORef (sessionMu session) new_mu
 
   modifyIORef' (generatedTokens session) $ \vec -> vec <> V.singleton new_token

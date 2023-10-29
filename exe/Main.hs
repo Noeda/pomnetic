@@ -3,7 +3,6 @@
 module Main where
 
 import Control.Concurrent.Async
-import Data.Foldable
 import qualified Data.Text as T
 import Pomnetic
 
@@ -11,7 +10,8 @@ main :: IO ()
 main = do
   manager <- newManager "zephyr-7b-beta.Q6_K.gguf"
     (setAfterGenWaitMs 500 $
-     setStartGenAfterNWaiters 5 defaultManagerSettings)
+     setStartGenAfterNWaiters 5 $
+     enableDebugLog defaultManagerSettings)
 
   forConcurrently_ [1..5] $ \idx ->
     withSession manager $ \session -> do

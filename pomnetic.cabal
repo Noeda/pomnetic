@@ -16,13 +16,16 @@ common warnings
 
 library
     import:           warnings
-    exposed-modules:  Pomnetic.Medium
+    exposed-modules:  Pomnetic.Error
+                      Pomnetic.Medium
                       Pomnetic
     build-depends:    base >=4.9 && <5.0
                      ,clock
                      ,containers
                      ,mtl
                      ,primitive
+                     ,regex-base
+                     ,regex-tdfa
                      ,stm
                      ,text
                      ,vector

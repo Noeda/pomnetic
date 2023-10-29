@@ -150,7 +150,12 @@ void hs_get_logits(llama_context* ctx, int idx, float* logits) {
     memcpy(logits, l, sizeof(float) * hs_get_vocab_size(ctx));
 }
 
-int32_t hs_sample_mirostat(llama_context* ctx, float* logits, float* mu, uint8_t* blacklist, float tau, float eta) {
+int32_t hs_sample_mirostat(llama_context* ctx,
+                           float* logits,
+                           float* mu,
+                           uint8_t* blacklist,
+                           float tau,
+                           float eta) {
     llama_token_data_array arr;
     memset(&arr, 0, sizeof(arr));
     int vocab_size = hs_get_vocab_size(ctx);
@@ -173,6 +178,12 @@ int32_t hs_sample_mirostat(llama_context* ctx, float* logits, float* mu, uint8_t
         arr.data[arr_cursor].p = 0.0;
         arr_cursor++;
         arr.size++;
+    }
+
+    if (arr_cursor == 0) {
+        free(arr.data);
+        // everything was blacklisted
+        return -1;
     }
 
     int32_t result = llama_sample_token_mirostat_v2(ctx, &arr, tau, eta, mu);
