@@ -410,8 +410,7 @@ fillBlacklist filters ptr vocab_size = do
     go f1 `IS.intersection` go f2
   go (OrFilter f1 f2) =
     go f1 `IS.union` go f2
-  go (BanTokens tokens) =
-    tokens `IS.union` banlist
+  go (BanTokens tokens) = tokens
 
 cfloatToFloat :: CFloat -> Float
 cfloatToFloat = realToFrac

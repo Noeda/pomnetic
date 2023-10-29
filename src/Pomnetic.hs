@@ -28,6 +28,8 @@ module Pomnetic
   , setStartGenAfterNWaiters
   , PomneticError(..)
   , withSession
+  , sessionContext
+  , sessionModel
   , wholeText
   , addText
   , resetText
@@ -264,6 +266,12 @@ data Session = Session
   , sessionManager :: !Manager
   , sessionSeqIdx :: !Int }
 
+sessionContext :: Session -> Context
+sessionContext = cmContext . sessionManager
+
+sessionModel :: Session -> Model
+sessionModel = cmModel . sessionManager
+
 -- | Creates a new session, runs code inside the session, and then cleans up
 -- the session.
 --
@@ -343,7 +351,7 @@ generateText session config = liftIO $ do
   mu <- readIORef (sessionMu session)
   (new_token, new_mu) <- case sampler config of
     Mirostat mirostat_config ->
-      sampleMirostat (cmContext $ sessionManager session) logits mu mempty mirostat_config
+      sampleMirostat (cmContext $ sessionManager session) logits mu (filters config) mirostat_config
   writeIORef (sessionMu session) new_mu
 
   modifyIORef' (generatedTokens session) $ \vec -> vec <> V.singleton new_token
