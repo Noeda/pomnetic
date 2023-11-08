@@ -28,6 +28,7 @@ module Pomnetic
   , setStartGenAfterNWaiters
   , PomneticError(..)
   , withSession
+  , Session()
   , sessionContext
   , sessionModel
   , wholeText
