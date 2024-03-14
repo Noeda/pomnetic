@@ -22,6 +22,7 @@ module Pomnetic
   , ManagerSettings()
   , defaultManagerSettings
   , enableDebugLog
+  , setMaxContextLength
   , setAfterGenWaitMs
   , afterGenWaitMs
   , startGenAfterNWaiters
@@ -111,14 +112,27 @@ type UseDebugLog = Bool
 data ManagerSettings = ManagerSettings
   { debugLog :: !UseDebugLog
   , afterGenWaitMs :: !Integer
-  , startGenAfterNWaiters :: !Integer }
+  , startGenAfterNWaiters :: !Integer
+  , maxContextLength :: !(Maybe Int) }
   deriving ( Eq, Ord, Show, Read, Typeable, Data, Generic )
 
 defaultManagerSettings :: ManagerSettings
 defaultManagerSettings = ManagerSettings
   { debugLog = False
   , startGenAfterNWaiters = 0
-  , afterGenWaitMs = 0 }
+  , afterGenWaitMs = 0
+  , maxContextLength = Nothing }
+
+-- | Sets maximum context length for any loaded model.
+--
+-- Normally, the maximum context length is determined by the model itself, but
+-- you can override it with this function.
+--
+-- There are models out there with very long context lengths.
+--
+-- Default is no limit.
+setMaxContextLength :: Int -> ManagerSettings -> ManagerSettings
+setMaxContextLength n settings = settings { maxContextLength = Just n }
 
 -- | Enables debug log. This will make the manager write to stderr about
 -- everything that happens. Noisy.
@@ -130,8 +144,9 @@ enableDebugLog settings = settings { debugLog = True }
 -- By default this is 0. Why would you want to add a delay? The reason is that
 -- if you have multiple threads, all vying for their turn to generate text,
 -- instantly picking up new work and processing it will most likely not get
--- every thread on board, and some of them will wait. A tiny delay (e.g. 5ms)
--- is often already enough to mitigate this.
+-- every thread on board, and some of them will wait (normally they'd be
+-- batched; which is more efficient). A tiny delay (e.g. 5ms) is often already
+-- enough to mitigate this.
 --
 -- If `startGenAfterNWaiters` is also set, then that can trigger generation
 -- earlier.
@@ -158,10 +173,20 @@ setStartGenAfterNWaiters n settings = settings { startGenAfterNWaiters = n }
 -- One manager handles one or more sessions generating text, batching their
 -- text generation in an efficient way behind the scenes if they are generating
 -- text at the same time from multiple threads.
-newManager :: MonadIO m => FilePath -> ManagerSettings -> m Manager
+newManager :: MonadIO m
+           => FilePath
+           -> ManagerSettings
+           -> m Manager
 newManager fpath manager_settings = liftIO $ mask_ $ do
   model <- loadModel fpath
-  ctx <- createContext model
+
+  settings' <- makeSensibleDefaultContextSettings model
+
+  let settings = settings' { contextSettingsMaxTokens = case maxContextLength manager_settings of
+                                                         Nothing -> contextSettingsMaxTokens settings'
+                                                         Just n -> min (contextSettingsMaxTokens settings') n }
+
+  ctx <- createContext model settings
   work <- newTVarIO SQ.empty
 
   tid <- forkIOWithUnmask $ \unmask -> unmask $ do

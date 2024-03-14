@@ -51,6 +51,10 @@ module Pomnetic.Medium
   -- * Contexts
   , createContext
   , Context()
+  , ContextSettings(..)
+  , getContextLengthFromMetadata
+  , makeSensibleDefaultContextSettings
+  , makeSensibleDefaultContextSettingsFromContextLength
   , forgetTokens
   -- * Errors
   , PomneticError(..)
@@ -98,6 +102,7 @@ import Control.Monad.IO.Class
 import Control.Monad.Primitive ( touch )
 import Data.Data
 import Data.Int
+import Data.Maybe
 import Data.Word
 import GHC.Generics
 import Foreign.C.String
@@ -116,16 +121,24 @@ import qualified Data.Text.Encoding as T
 import Data.Vector ( Vector )
 import qualified Data.Vector as V
 import Pomnetic.Error
+import Pomnetic.Safe ( safeFromIntegral )
 import System.IO.Unsafe
 import Text.Regex.Base.RegexLike
 import Text.Regex.TDFA.Text
 
-foreign import ccall "hs_llama_load_model" c_llama_load_model :: CString -> IO (Ptr CModel)
+foreign import ccall "hs_llama_load_model" c_llama_load_model :: CString -> CInt -> IO (Ptr CModel)
 foreign import ccall "&hs_llama_free_model" fptr_c_llama_free_model :: FunPtr (Ptr CModel -> IO ())
 
-foreign import ccall "hs_llama_create_context" c_llama_create_context :: Ptr CModel -> IO (Ptr CContext)
-foreign import ccall "&hs_llama_free_context" fptr_c_llama_free_context :: FunPtr (Ptr CContext -> IO ())
+foreign import ccall "hs_llama_read_context_length_from_metadata" c_llama_read_context_length_from_metadata :: Ptr CModel -> IO CInt
 
+foreign import ccall "hs_llama_create_context" c_llama_create_context
+    :: Ptr CModel
+    -> CInt
+    -> CInt
+    -> CInt
+    -> CInt
+    -> IO (Ptr CContext)
+foreign import ccall "&hs_llama_free_context" fptr_c_llama_free_context :: FunPtr (Ptr CContext -> IO ())
 foreign import ccall "hs_llama_tokenize" c_llama_tokenize :: Ptr CModel -> CString -> Ptr (Ptr Int32) -> Ptr CSize -> IO CInt
 foreign import ccall "hs_free_tokens" c_llama_free_tokens :: Ptr Int32 -> IO ()
 
@@ -193,8 +206,9 @@ withModel (Model model_fptr) action = withForeignPtr model_fptr action
 
 loadModel :: FilePath -> IO Model
 loadModel fpath = mask_ $ do
+  -- TODO: set 10000 (number of gpu layers to be configurable)
   raw_model <- withCString fpath $ \fpath_str ->
-    c_llama_load_model fpath_str
+    c_llama_load_model fpath_str 10000
 
   when (raw_model == nullPtr) $
     pomneticError $ "Failed to load model: " <> fpath
@@ -202,14 +216,65 @@ loadModel fpath = mask_ $ do
   fptr <- newForeignPtr fptr_c_llama_free_model raw_model
   return $ Model fptr
 
-createContext :: Model -> IO Context
-createContext model = mask_ $ withModel model $ \model_ptr -> do
-  raw_context <- c_llama_create_context model_ptr
+data ContextSettings = ContextSettings
+  { contextSettingsMaxTokens :: !ContextLength
+  , contextSettingsBatchSize :: !Int
+  , contextSettingsNumThreads :: !Int
+  , contextSettingsNumBatchThreads :: !Int }
+  deriving ( Eq, Ord, Show, Read, Data, Typeable, Generic )
+
+type ContextLength = Int
+
+-- | Given a model, reads out context length out of its metadata. The metadata
+-- (usually) tells maximum context length the model can handle coherency;
+-- assuming the .gguf file was made to include that properly.
+--
+-- If the model does not have a context length, or something goes wrong with
+-- this, `Nothing` is returned.
+getContextLengthFromMetadata :: MonadIO m => Model -> m (Maybe ContextLength)
+getContextLengthFromMetadata model = liftIO $ withModel model $ \model_ptr -> do
+  context_length <- c_llama_read_context_length_from_metadata model_ptr
+  return $ if context_length <= 0
+    then Nothing
+    else Just $ safeFromIntegral context_length
+
+-- | Given a model path, returns sensible default settings.
+--
+-- This attempts to read context length from the model. Otherwise behaves same
+-- as `makeSensibleDefaultContextSettingsFromContextLength`.
+makeSensibleDefaultContextSettings :: MonadIO m => Model -> m ContextSettings
+makeSensibleDefaultContextSettings model = liftIO $ do
+  ctx_length <- getContextLengthFromMetadata model
+  makeSensibleDefaultContextSettingsFromContextLength $ fromMaybe 8192 ctx_length
+
+-- | Given a desired context length, returns sensible default settings.
+--
+-- The default settings use a maximum of 16 CPU cores, otherwise it uses the
+-- number of cores available (as reported by `getNumCapabilities`).
+makeSensibleDefaultContextSettingsFromContextLength :: MonadIO m => ContextLength -> m ContextSettings
+makeSensibleDefaultContextSettingsFromContextLength n_ctx = liftIO $ do
+  n_cpus <- max 16 <$> getNumCapabilities
+  return $ ContextSettings {
+    contextSettingsMaxTokens = n_ctx,
+    contextSettingsBatchSize = 512,
+    contextSettingsNumThreads = n_cpus,
+    contextSettingsNumBatchThreads = n_cpus
+  }
+
+createContext :: Model -> ContextSettings -> IO Context
+createContext model settings = mask_ $ withModel model $ \model_ptr -> do
+
+  let n_batch = safeFromIntegral (contextSettingsBatchSize settings)
+      n_ctx = safeFromIntegral (contextSettingsMaxTokens settings)
+      n_threads = safeFromIntegral (contextSettingsNumThreads settings)
+      n_batch_threads = safeFromIntegral (contextSettingsNumBatchThreads settings)
+
+  raw_context <- c_llama_create_context model_ptr n_batch n_ctx n_threads n_batch_threads
 
   when (raw_context == nullPtr) $
     pomneticError "Failed to create context"
 
-  vocab_size <- fromIntegral <$> c_llama_vocab_size raw_context
+  vocab_size <- safeFromIntegral <$> c_llama_vocab_size raw_context
   fptr <- newForeignPtr fptr_c_llama_free_context raw_context
   mvar <- newMVar fptr
 
@@ -226,7 +291,7 @@ eosToken ctx = unsafePerformIO $ withContext ctx $ \ctx_ptr ->
 createBatch :: MonadIO m => Int -> m Batch
 createBatch sz | sz <= 0 = pomneticError "Batch size must be positive"
 createBatch sz = liftIO $ mask_ $ do
-  batch <- c_llama_create_batch (fromIntegral sz)
+  batch <- c_llama_create_batch (safeFromIntegral sz)
   when (batch == nullPtr) $
     pomneticError "Failed to create batch"
   fptr_batch <- newForeignPtr fptr_c_llama_free_batch batch
@@ -276,7 +341,7 @@ processBatch ctx (Batch fptr_batch) = liftIO $ withForeignPtr fptr_batch $ \ptr 
 -- forget all tokens for a sequence.
 forgetTokens :: MonadIO m => Context -> SeqID -> Int -> Int -> m ()
 forgetTokens ctx seq_id start end = liftIO $ withContext ctx $ \ctx_ptr ->
-  c_llama_remove_tokens ctx_ptr (fromIntegral seq_id) (fromIntegral start) (fromIntegral end)
+  c_llama_remove_tokens ctx_ptr (safeFromIntegral seq_id) (safeFromIntegral start) (safeFromIntegral end)
 
 setBatchItem :: Batch -> BatchItem -> Int -> IO ()
 setBatchItem batch@(Batch fptr_batch) item sz =
@@ -285,10 +350,10 @@ setBatchItem batch@(Batch fptr_batch) item sz =
     else withForeignPtr fptr_batch $ \batch_ptr ->
       let Token tk = token item
        in c_llama_set_batch_item batch_ptr
-                                 (fromIntegral sz)
-                                 (fromIntegral tk)
-                                 (fromIntegral $ position item)
-                                 (fromIntegral $ sequenceId item)
+                                 (safeFromIntegral sz)
+                                 (safeFromIntegral tk)
+                                 (safeFromIntegral $ position item)
+                                 (safeFromIntegral $ sequenceId item)
                                  (if logits item
                                    then 1
                                    else 0)
@@ -297,18 +362,18 @@ setBatchItem batch@(Batch fptr_batch) item sz =
 
 batchCapacity :: Batch -> Int
 batchCapacity (Batch fptr) = unsafePerformIO $ withForeignPtr fptr $ \ptr ->
-  fromIntegral <$> c_llama_batch_capacity ptr
+  safeFromIntegral <$> c_llama_batch_capacity ptr
 
 batchLength :: MonadIO m => Batch -> m Int
 batchLength (Batch fptr) = liftIO $ withForeignPtr fptr $ \ptr ->
-  fromIntegral <$> c_llama_batch_length ptr
+  safeFromIntegral <$> c_llama_batch_length ptr
 
 setBatchLength :: MonadIO m => Batch -> Int -> m ()
 setBatchLength batch@(Batch fptr) len =
   if len > cap || len < 0
     then pomneticError $ "Batch length must be less than " <> show cap
     else liftIO $ withForeignPtr fptr $ \ptr ->
-           c_llama_set_batch_length ptr (fromIntegral len)
+           c_llama_set_batch_length ptr (safeFromIntegral len)
  where
   cap = batchCapacity batch
 
@@ -321,7 +386,7 @@ getLogits :: MonadIO m => Context -> Int -> m Logits
 getLogits ctx idx =
   liftIO $ withContext ctx $ \ctx_ptr ->
     allocaArray (vocabSize ctx) $ \logits_ptr -> do
-      c_llama_get_logits ctx_ptr (fromIntegral idx) logits_ptr
+      c_llama_get_logits ctx_ptr (safeFromIntegral idx) logits_ptr
       V.fromList . fmap cfloatToFloat <$> peekArray (vocabSize ctx) logits_ptr
 
 -- | Filters constraint what the model can output.
@@ -383,12 +448,12 @@ type RegexFilterText = Text
 
 instance Monoid Filters where
   mempty = NoFilter
-  mappend NoFilter f2 = f2
-  mappend f1 NoFilter = f1
-  mappend f1 f2 = OrFilter f1 f2
+  mappend = (<>)
 
 instance Semigroup Filters where
-  f1 <> f2 = mappend f1 f2
+  f1 <> NoFilter = f1
+  NoFilter <> f2 = f2
+  f1 <> f2 = OrFilter f1 f2
 
 type MirostatMu = Float
 
@@ -426,11 +491,11 @@ sampleMirostat ctx@(Context _ model vocab_size) logits mu filters config regex_f
                               return (token_idx, new_mu)
 
             try_loop = do (token_idx, new_mu) <- sample_token
-                          let token = Token $ fromIntegral token_idx
+                          let token = Token $ safeFromIntegral token_idx
                           accepted <- test_fun token
                           if accepted
                             then return (token, new_mu)
-                            else do pokeElemOff blacklist_ptr (fromIntegral token_idx) 1
+                            else do pokeElemOff blacklist_ptr (safeFromIntegral token_idx) 1
                                     try_loop
 
         (token, new_mu) <- try_loop
@@ -521,9 +586,9 @@ tokenize model txt = unsafePerformIO $ withModel model $ \model_ptr ->
       ntokens <- peek tokens_sz_ptr
       tokens_ptr <- peek tokens_ptr_ptr
 
-      tokens <- V.generateM (fromIntegral ntokens) $ \idx -> do
+      tokens <- V.generateM (safeFromIntegral ntokens) $ \idx -> do
         val <- peekElemOff tokens_ptr idx
-        return $ Token $ fromIntegral val
+        return $ Token $ safeFromIntegral val
 
       c_llama_free_tokens tokens_ptr
 
@@ -540,7 +605,7 @@ tokenToText model (Token token) = unsafePerformIO $ withModel model $ \model_ptr
     str <- peek str_ptr
     str_len <- peek str_len_ptr
 
-    result <- peekCStringLen (str, fromIntegral str_len)
+    result <- peekCStringLen (str, safeFromIntegral str_len)
     c_llama_free_text str
 
     return $ T.pack result

@@ -18,6 +18,7 @@ library
     import:           warnings
     exposed-modules:  Pomnetic.Error
                       Pomnetic.Medium
+                      Pomnetic.Safe
                       Pomnetic
     build-depends:    attoparsec
                      ,base >=4.9 && <5.0
@@ -31,11 +32,11 @@ library
                      ,text
                      ,vector
     hs-source-dirs:   src
-    c-sources:        cbits/llama_glue.cc
+    cxx-sources:      cbits/llama_glue.cc
     extra-libraries:  llama, stdc++
     -- llama wants Accelerate on macOS typically
     if os(darwin)
-        frameworks:       Accelerate
+        frameworks:       Accelerate, CoreGraphics, Metal, MetalKit
     default-language: Haskell2010
 
 executable pomnetic
