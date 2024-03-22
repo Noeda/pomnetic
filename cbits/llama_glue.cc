@@ -200,6 +200,11 @@ int hs_decode(llama_context* ctx, hs_batch* batch) {
     return llama_decode(ctx, batch->batch);
 }
 
+int hs_get_vocab_size_model(llama_model* model) {
+    assert(model);
+    return llama_n_vocab(model);
+}
+
 int hs_get_vocab_size(llama_context* ctx) {
     assert(ctx);
 

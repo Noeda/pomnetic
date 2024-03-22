@@ -18,6 +18,9 @@
 
 module Pomnetic
   ( newManager
+  , newManagerFromModel
+  , Model()
+  , loadModel
   , Manager()
   , ManagerSettings()
   , defaultManagerSettings
@@ -33,14 +36,23 @@ module Pomnetic
   , sessionContext
   , sessionModel
   , wholeText
+  , wholeTokens
   , textFrom
   , addText
+  , addTokens
   , resetText
   , generateText
   -- * Generation configuration
   , GenerateConfig(..)
   , generateConfig
   , Sampler(..)
+  -- ** Raw logits
+  , nextLogits
+  , Logits
+  , tokenToText
+  , intToToken
+  , tokenToInt
+  , vocabularySize
   -- ** Filters
   , Filters()
   , andFilters
@@ -168,18 +180,12 @@ setAfterGenWaitMs ms settings = settings { afterGenWaitMs = ms }
 setStartGenAfterNWaiters :: Integer -> ManagerSettings -> ManagerSettings
 setStartGenAfterNWaiters n settings = settings { startGenAfterNWaiters = n }
 
--- | Creates a new manager.
---
--- One manager handles one or more sessions generating text, batching their
--- text generation in an efficient way behind the scenes if they are generating
--- text at the same time from multiple threads.
-newManager :: MonadIO m
-           => FilePath
-           -> ManagerSettings
-           -> m Manager
-newManager fpath manager_settings = liftIO $ mask_ $ do
-  model <- loadModel fpath
-
+-- | Creates a new manager, from a `Model`. Otherwise same as `newManager`.
+newManagerFromModel :: MonadIO m
+                    => Model
+                    -> ManagerSettings
+                    -> m Manager
+newManagerFromModel model manager_settings = liftIO $ mask_ $ do
   settings' <- makeSensibleDefaultContextSettings model
 
   let settings = settings' { contextSettingsMaxTokens = case maxContextLength manager_settings of
@@ -202,6 +208,23 @@ newManager fpath manager_settings = liftIO $ mask_ $ do
 
   available_seq_idxs <- newTVarIO $ IS.fromList [0..99]
   return $ Manager model ctx available_seq_idxs work
+
+-- | Creates a new manager.
+--
+-- One manager handles one or more sessions generating text, batching their
+-- text generation in an efficient way behind the scenes if they are generating
+-- text at the same time from multiple threads.
+--
+-- If your program is likely going to use multiple managers, you may want to
+-- use `loadModel` and `newManagerFromModel` instead, so that all managers can
+-- share the same model.
+newManager :: MonadIO m
+           => FilePath
+           -> ManagerSettings
+           -> m Manager
+newManager fpath manager_settings = do
+  model <- loadModel fpath
+  newManagerFromModel model manager_settings
 
 worker :: Model -> Context -> TVar (SQ.Seq Work) -> UseDebugLog -> Integer -> Integer -> IO ()
 worker model
@@ -344,6 +367,15 @@ wholeText session = liftIO $ do
 
   return txt
 
+-- | Returns the current text in the session, in the form of tokens.
+--
+-- Does not include the BOS token.
+wholeTokens :: MonadIO m => Session -> m (Vector Token)
+wholeTokens session = liftIO $ do
+  applyWantedTokens session
+  result <- readIORef (generatedTokens session)
+  return $ V.tail result
+
 -- | Returns text starting from a certain index (in tokens).
 textFrom :: MonadIO m => Session -> Int -> m Text
 textFrom session start = liftIO $ do
@@ -380,6 +412,13 @@ generateText session config = liftIO $ do
   applyWantedTokens session
   n_tokens_generated <- fmap V.length $ readIORef (generatedTokens session)
   generateText2 session config n_tokens_generated
+
+-- | Returns logits for what would be the next token.
+nextLogits :: MonadIO m => Session -> m Logits
+nextLogits session = liftIO $ do
+  applyWantedTokens session
+  logits <- fmap fromJust $ atomically $ readTVar (logitsTVar session)
+  return logits
 
 generateText2 :: Session -> GenerateConfig -> Int -> IO ()
 generateText2 _ config _ | numTokens config == 0 = return ()
@@ -513,6 +552,11 @@ addText session text = liftIO $ do
   let model = cmModel (sessionManager session)
       new_tokens = tokenize model text
   modifyIORef' (wantedTokens session) (<> new_tokens)
+
+-- | Adds tokens to the end of the current session.
+addTokens :: MonadIO m => Session -> Vector Token -> m ()
+addTokens session tokens = liftIO $ do
+  modifyIORef' (wantedTokens session) (<> tokens)
 
 -- | Erases all text from the session.
 resetText :: MonadIO m => Session -> m ()

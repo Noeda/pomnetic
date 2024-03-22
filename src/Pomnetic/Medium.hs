@@ -64,6 +64,9 @@ module Pomnetic.Medium
   , bosToken
   , eosToken
   , tokenToText
+  , tokenToInt
+  , intToToken
+  , vocabularySize
   -- * Filtering
   --
   -- Filtering is used to constraint what output the LLM can generate.
@@ -122,6 +125,7 @@ import Data.Vector ( Vector )
 import qualified Data.Vector as V
 import Pomnetic.Error
 import Pomnetic.Safe ( safeFromIntegral )
+import Pomnetic.Types
 import System.IO.Unsafe
 import Text.Regex.Base.RegexLike
 import Text.Regex.TDFA.Text
@@ -166,13 +170,21 @@ foreign import ccall unsafe "hs_set_batch_length" c_llama_set_batch_length :: Pt
 foreign import ccall "hs_decode" c_llama_decode :: Ptr CContext -> Ptr CBatch -> IO CInt
 foreign import ccall unsafe "hs_get_logits" c_llama_get_logits :: Ptr CContext -> CInt -> Ptr CFloat -> IO ()
 foreign import ccall unsafe "hs_get_vocab_size" c_llama_vocab_size :: Ptr CContext -> IO CInt
+foreign import ccall unsafe "hs_get_vocab_size_model" c_llama_vocab_size_model :: Ptr CModel -> IO CInt
 foreign import ccall "hs_sample_mirostat" c_llama_sample_mirostat :: Ptr CContext -> Ptr CFloat -> Ptr CFloat -> Ptr Word8 -> CFloat -> CFloat -> IO Int32
 
 foreign import ccall "hs_remove_tokens" c_llama_remove_tokens :: Ptr CContext -> CInt -> CInt -> CInt -> IO ()
 
--- Match with llama.cpp
-newtype Token = Token Int32
-  deriving ( Eq, Ord, Show, Data, Typeable, Storable, Generic )
+tokenToInt :: Token -> Int
+tokenToInt (Token tk) = fromIntegral tk
+
+intToToken :: Int -> Token
+intToToken = Token . fromIntegral
+
+vocabularySize :: Model -> Int
+vocabularySize model = unsafePerformIO $ withModel model $ \model_ptr -> do
+  vocab_size <- c_llama_vocab_size_model model_ptr
+  return $ fromIntegral vocab_size
 
 newtype Batch = Batch (ForeignPtr CBatch)
   deriving ( Eq, Ord, Show )
@@ -204,8 +216,8 @@ withContext (Context ctx_mvar model _) action = withMVar ctx_mvar $ \ctx_fptr ->
 withModel :: Model -> (Ptr CModel -> IO a) -> IO a
 withModel (Model model_fptr) action = withForeignPtr model_fptr action
 
-loadModel :: FilePath -> IO Model
-loadModel fpath = mask_ $ do
+loadModel :: MonadIO m => FilePath -> m Model
+loadModel fpath = liftIO $ mask_ $ do
   -- TODO: set 10000 (number of gpu layers to be configurable)
   raw_model <- withCString fpath $ \fpath_str ->
     c_llama_load_model fpath_str 10000
@@ -594,10 +606,17 @@ tokenize model txt = unsafePerformIO $ withModel model $ \model_ptr ->
 
       return tokens
 
+-- | Converts a token to its text piece. May throw `InvalidToken` if the token
+-- is not valid.
 tokenToText :: Model -> Token -> Text
-tokenToText model (Token token) = unsafePerformIO $ withModel model $ \model_ptr ->
+tokenToText _model (Token token) | token < 0 = throw $ InvalidToken (Token token)
+tokenToText model (Token token) = unsafePerformIO $ withModel model $ \model_ptr -> do
+  vocab_size <- safeFromIntegral <$> c_llama_vocab_size_model model_ptr
+  when (token >= vocab_size) $
+    throwIO $ InvalidToken (Token token)
+
   alloca $ \str_ptr ->
-  alloca $ \str_len_ptr -> mask_ $ do
+   alloca $ \str_len_ptr -> mask_ $ do
     result <- c_llama_token_to_text model_ptr token str_ptr str_len_ptr
     when (result /= 0) $
       pomneticError "Failed to convert token to text"
