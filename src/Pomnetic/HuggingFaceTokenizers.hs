@@ -34,7 +34,9 @@ import Foreign.C.Types
 import GHC.Generics
 import Pomnetic.Safe
 import Pomnetic.Types
+import Pomnetic.PyHuggingFaceTokenizers ( pycode )
 import System.IO
+import System.IO.Temp
 import System.IO.Unsafe
 import System.Process
 import System.Process.Internals
@@ -68,9 +70,13 @@ withPyInterpreter f = do
     Right x -> return x
  where
   launchInterpreter :: IO (ProcessHandle, Handle, Handle)
-  launchInterpreter = mask_ $ do
+  launchInterpreter = mask_ $ withSystemTempFile "pomnetic_pyglue.py" $ \temp_file_path temp_file_handle -> do
+
+    T.hPutStr temp_file_handle pycode
+    hClose temp_file_handle
+
     (Just istdin, Just istdout, _, phandle) <- createProcess
-      (shell "python pyglue/pyglue.py")
+      (proc "python" [temp_file_path])
         { std_in = CreatePipe
         , std_out = CreatePipe
         , std_err = Inherit

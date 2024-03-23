@@ -1,3 +1,16 @@
+-- This file is nothing but giant multi-line string for Python to execute.
+
+{-# LANGUAGE QuasiQuotes #-}
+
+module Pomnetic.PyHuggingFaceTokenizers
+  ( pycode )
+  where
+
+import Data.Text ( Text )
+import NeatInterpolation
+
+pycode :: Text
+pycode = [trimming|
 #!/usr/bin/env python
 
 import io
@@ -92,3 +105,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+|]

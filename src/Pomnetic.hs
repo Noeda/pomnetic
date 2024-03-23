@@ -21,6 +21,9 @@ module Pomnetic
   , newManagerFromModel
   , Model()
   , loadModel
+  , loadModelWithHFTokenizer
+  , hfTokenize
+  , hfTokenizeEmpty
   , Manager()
   , ManagerSettings()
   , defaultManagerSettings
@@ -84,6 +87,7 @@ import Data.Text ( Text )
 import Data.Vector ( Vector )
 import qualified Data.Vector as V
 import GHC.Generics
+import Pomnetic.HuggingFaceTokenizers
 import Pomnetic.Medium
 import System.Clock
 import System.IO
