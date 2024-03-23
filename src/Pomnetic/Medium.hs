@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 --
 -- Medium-level bindings to llama.cpp
 --
@@ -48,6 +50,7 @@ module Pomnetic.Medium
   -- * Models
     Model()
   , loadModel
+  , loadModelWithHFTokenizer
   -- * Contexts
   , createContext
   , Context()
@@ -63,6 +66,8 @@ module Pomnetic.Medium
   , tokenize
   , bosToken
   , eosToken
+  , bosTokenModel
+  , eosTokenModel
   , tokenToText
   , tokenToInt
   , intToToken
@@ -105,6 +110,7 @@ import Control.Monad.IO.Class
 import Control.Monad.Primitive ( touch )
 import Data.Data
 import Data.Int
+import Data.IORef
 import Data.Maybe
 import Data.Word
 import GHC.Generics
@@ -124,6 +130,7 @@ import qualified Data.Text.Encoding as T
 import Data.Vector ( Vector )
 import qualified Data.Vector as V
 import Pomnetic.Error
+import Pomnetic.HuggingFaceTokenizers
 import Pomnetic.Safe ( safeFromIntegral )
 import Pomnetic.Types
 import System.IO.Unsafe
@@ -146,8 +153,8 @@ foreign import ccall "&hs_llama_free_context" fptr_c_llama_free_context :: FunPt
 foreign import ccall "hs_llama_tokenize" c_llama_tokenize :: Ptr CModel -> CString -> Ptr (Ptr Int32) -> Ptr CSize -> IO CInt
 foreign import ccall "hs_free_tokens" c_llama_free_tokens :: Ptr Int32 -> IO ()
 
-foreign import ccall "hs_bos_token" c_llama_bos_token :: Ptr CContext -> IO Int32
-foreign import ccall "hs_eos_token" c_llama_eos_token :: Ptr CContext -> IO Int32
+foreign import ccall "hs_bos_token_model" c_llama_bos_token_model :: Ptr CModel -> IO Int32
+foreign import ccall "hs_eos_token_model" c_llama_eos_token_model :: Ptr CModel -> IO Int32
 
 foreign import ccall "hs_token_to_text" c_llama_token_to_text :: Ptr CModel -> Int32 -> Ptr CString -> Ptr CSize -> IO CInt
 foreign import ccall "hs_free_text" c_llama_free_text :: CString -> IO ()
@@ -175,12 +182,6 @@ foreign import ccall "hs_sample_mirostat" c_llama_sample_mirostat :: Ptr CContex
 
 foreign import ccall "hs_remove_tokens" c_llama_remove_tokens :: Ptr CContext -> CInt -> CInt -> CInt -> IO ()
 
-tokenToInt :: Token -> Int
-tokenToInt (Token tk) = fromIntegral tk
-
-intToToken :: Int -> Token
-intToToken = Token . fromIntegral
-
 vocabularySize :: Model -> Int
 vocabularySize model = unsafePerformIO $ withModel model $ \model_ptr -> do
   vocab_size <- c_llama_vocab_size_model model_ptr
@@ -196,14 +197,28 @@ data CBatch
 data Context = Context (MVar (ForeignPtr CContext)) !Model !Int -- vocab size
   deriving ( Eq )
 
-newtype Model = Model (ForeignPtr CModel)
-  deriving ( Eq, Ord, Show )
+contextModel :: Context -> Model
+contextModel (Context _ model _) = model
+
+data Model = Model {
+    modelForeignPtr :: !(ForeignPtr CModel)
+  , hfTokenizer :: !(IORef (Maybe HFTokenize))
+  }
+
+instance Show Model where
+  show model = "<#Model " <> show (modelForeignPtr model) <> ">"
+
+instance Eq Model where
+  m1 == m2 = modelForeignPtr m1 == modelForeignPtr m2
+
+instance Ord Model where
+  m1 `compare` m2 = modelForeignPtr m1 `compare` modelForeignPtr m2
 
 pomneticError :: MonadIO m => String -> m a
 pomneticError msg = liftIO $ throwIO $ PomneticError msg
 
 touchModel :: Model -> IO ()
-touchModel (Model model_fptr) = withForeignPtr model_fptr $ \model_ptr ->
+touchModel model = withForeignPtr (modelForeignPtr model) $ \model_ptr ->
   touch model_ptr
 
 withContext :: Context -> (Ptr CContext -> IO a) -> IO a
@@ -214,7 +229,18 @@ withContext (Context ctx_mvar model _) action = withMVar ctx_mvar $ \ctx_fptr ->
     return result
 
 withModel :: Model -> (Ptr CModel -> IO a) -> IO a
-withModel (Model model_fptr) action = withForeignPtr model_fptr action
+withModel model action = withForeignPtr (modelForeignPtr model) action
+
+-- | Same as `loadModel` but uses a HuggingFace tokenizer.
+--
+-- Use `hfTokenizeEmpty` from Pomnetic.HuggingFaceTokenizers to make the
+-- `HFTokenize` argument. It would take the model_id you would normally use in
+-- AutoTokenizer.from_pretrained in HuggingFace Python.
+loadModelWithHFTokenizer :: MonadIO m => FilePath -> HFTokenize -> m Model
+loadModelWithHFTokenizer fpath hftokenize = do
+  model <- loadModel fpath
+  setModelToHFTokenizer model hftokenize
+  return model
 
 loadModel :: MonadIO m => FilePath -> m Model
 loadModel fpath = liftIO $ mask_ $ do
@@ -225,8 +251,39 @@ loadModel fpath = liftIO $ mask_ $ do
   when (raw_model == nullPtr) $
     pomneticError $ "Failed to load model: " <> fpath
 
+  hf_tokenizer_ref <- newIORef Nothing
+
   fptr <- newForeignPtr fptr_c_llama_free_model raw_model
-  return $ Model fptr
+  return $ Model {
+    modelForeignPtr = fptr
+  , hfTokenizer = hf_tokenizer_ref
+  }
+
+-- NOT EXPORTED AS PUBLIC API BECAUSE YOU CAN USE IT TO BREAK REFERENTIAL
+-- TRANSPARENCY (some functions use unsafePerformIO because they don't expect
+-- side effects. This function is called by loadModel instead to prevent
+-- setting a HF tokenizer after the fact).
+--
+-- Makes a model use a HuggingFace tokenizer.
+--
+-- The user is responsible for making sure the tokenizer is compatible with the
+-- model.
+--
+-- You give it a loaded model, and the a model_id as you would in HuggingFace
+-- Python in AutoTokenizer.from_pretrained.
+--
+-- You can use `hfTokenizeEmpty` from Pomnetic.HuggingFaceTokenizers to make
+-- the `HFTokenize` value for this function.
+--
+-- Once set, all tokenization functions will use the HuggingFace tokenizer.
+-- This involves launching a Python process and importing the transformers
+-- library, so using a HF tokenizer requires a Python setup.
+--
+-- This function is lazy and will not launch the Python process until the first
+-- token-related function is called.
+setModelToHFTokenizer :: MonadIO m => Model -> HFTokenize -> m ()
+setModelToHFTokenizer model hftokenize = liftIO $
+  writeIORef (hfTokenizer model) (Just hftokenize)
 
 data ContextSettings = ContextSettings
   { contextSettingsMaxTokens :: !ContextLength
@@ -292,13 +349,31 @@ createContext model settings = mask_ $ withModel model $ \model_ptr -> do
 
   return $ Context mvar model vocab_size
 
+bosTokenModel :: Model -> Token
+bosTokenModel model = unsafePerformIO $ do
+  ref <- readIORef (hfTokenizer model)
+  case ref of
+    Nothing -> withModel model $ \model_ptr ->
+                 Token <$> c_llama_bos_token_model model_ptr
+    Just hf -> bosTokenByHF (hfModelID hf) >>= \case
+      Nothing -> throwIO NoRequestedTokenExists
+      Just token -> return token
+
+eosTokenModel :: Model -> Token
+eosTokenModel model = unsafePerformIO $ do
+  ref <- readIORef (hfTokenizer model)
+  case ref of
+    Nothing -> withModel model $ \model_ptr ->
+                 Token <$> c_llama_eos_token_model model_ptr
+    Just hf -> eosTokenByHF (hfModelID hf) >>= \case
+      Nothing -> throwIO NoRequestedTokenExists
+      Just token -> return token
+
 bosToken :: Context -> Token
-bosToken ctx = unsafePerformIO $ withContext ctx $ \ctx_ptr ->
-  Token <$> c_llama_bos_token ctx_ptr
+bosToken ctx = bosTokenModel (contextModel ctx)
 
 eosToken :: Context -> Token
-eosToken ctx = unsafePerformIO $ withContext ctx $ \ctx_ptr ->
-  Token <$> c_llama_eos_token ctx_ptr
+eosToken ctx = eosTokenModel (contextModel ctx)
 
 createBatch :: MonadIO m => Int -> m Batch
 createBatch sz | sz <= 0 = pomneticError "Batch size must be positive"
@@ -586,45 +661,61 @@ fillBlacklist filters ptr vocab_size model regex_filter_text = do
 cfloatToFloat :: CFloat -> Float
 cfloatToFloat = realToFrac
 
+-- | Tokenizes a text. Does not add special tokens (like bos or eos).
 tokenize :: Model -> Text -> Vector Token
-tokenize model txt = unsafePerformIO $ withModel model $ \model_ptr -> 
-  withCString (T.unpack txt) $ \str -> mask_ $
-    alloca $ \tokens_ptr_ptr ->
-    alloca $ \tokens_sz_ptr -> do
-      result <- c_llama_tokenize model_ptr str tokens_ptr_ptr tokens_sz_ptr
-      when (result /= 0) $
-        pomneticError "Failed to tokenize"
+tokenize model txt = unsafePerformIO $ do
+  ref <- readIORef (hfTokenizer model)
+  case ref of
+    Nothing -> llamaTokenize model txt
+    Just hf -> tokenizeByHF hf { addSpecialTokens = False, textToTokenize = txt }
+ where
+  llamaTokenize :: Model -> Text -> IO (Vector Token)
+  llamaTokenize model txt =
+    withModel model $ \model_ptr -> 
+      withCString (T.unpack txt) $ \str -> mask_ $
+        alloca $ \tokens_ptr_ptr ->
+        alloca $ \tokens_sz_ptr -> do
+          result <- c_llama_tokenize model_ptr str tokens_ptr_ptr tokens_sz_ptr
+          when (result /= 0) $
+            pomneticError "Failed to tokenize"
 
-      ntokens <- peek tokens_sz_ptr
-      tokens_ptr <- peek tokens_ptr_ptr
+          ntokens <- peek tokens_sz_ptr
+          tokens_ptr <- peek tokens_ptr_ptr
 
-      tokens <- V.generateM (safeFromIntegral ntokens) $ \idx -> do
-        val <- peekElemOff tokens_ptr idx
-        return $ Token $ safeFromIntegral val
+          tokens <- V.generateM (safeFromIntegral ntokens) $ \idx -> do
+            val <- peekElemOff tokens_ptr idx
+            return $ Token $ safeFromIntegral val
 
-      c_llama_free_tokens tokens_ptr
+          c_llama_free_tokens tokens_ptr
 
-      return tokens
+          return tokens
 
 -- | Converts a token to its text piece. May throw `InvalidToken` if the token
 -- is not valid.
 tokenToText :: Model -> Token -> Text
 tokenToText _model (Token token) | token < 0 = throw $ InvalidToken (Token token)
-tokenToText model (Token token) = unsafePerformIO $ withModel model $ \model_ptr -> do
-  vocab_size <- safeFromIntegral <$> c_llama_vocab_size_model model_ptr
-  when (token >= vocab_size) $
-    throwIO $ InvalidToken (Token token)
+tokenToText model token = unsafePerformIO $ do
+  ref <- readIORef (hfTokenizer model)
+  case ref of
+    Nothing -> llamaTokenToText model token
+    Just hf -> tokenToTextByHF (hfModelID hf) token
+ where
+  llamaTokenToText :: Model -> Token -> IO Text
+  llamaTokenToText model (Token token) = withModel model $ \model_ptr -> do
+    vocab_size <- safeFromIntegral <$> c_llama_vocab_size_model model_ptr
+    when (token >= vocab_size) $
+      throwIO $ InvalidToken (Token token)
 
-  alloca $ \str_ptr ->
-   alloca $ \str_len_ptr -> mask_ $ do
-    result <- c_llama_token_to_text model_ptr token str_ptr str_len_ptr
-    when (result /= 0) $
-      pomneticError "Failed to convert token to text"
+    alloca $ \str_ptr ->
+     alloca $ \str_len_ptr -> mask_ $ do
+      result <- c_llama_token_to_text model_ptr token str_ptr str_len_ptr
+      when (result /= 0) $
+        pomneticError "Failed to convert token to text"
 
-    str <- peek str_ptr
-    str_len <- peek str_len_ptr
+      str <- peek str_ptr
+      str_len <- peek str_len_ptr
 
-    result <- peekCStringLen (str, safeFromIntegral str_len)
-    c_llama_free_text str
+      result <- peekCStringLen (str, safeFromIntegral str_len)
+      c_llama_free_text str
 
-    return $ T.pack result
+      return $ T.pack result

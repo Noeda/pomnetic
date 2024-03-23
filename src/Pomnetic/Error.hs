@@ -13,6 +13,7 @@ import Pomnetic.Types
 
 data PomneticError
   = PomneticError String
+  | NoRequestedTokenExists -- thrown when bos or eos was asked and model doesn ot have any.
   | TooLongText
   | AllTokensRejected
   | InvalidRegex !Text   -- text will contain human-readable message

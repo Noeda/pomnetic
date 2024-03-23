@@ -17,20 +17,25 @@ common warnings
 library
     import:           warnings
     exposed-modules:  Pomnetic.Error
+                      Pomnetic.HuggingFaceTokenizers
                       Pomnetic.Medium
                       Pomnetic.Safe
                       Pomnetic.Types
                       Pomnetic
-    build-depends:    attoparsec
+    build-depends:    aeson
+                     ,attoparsec
                      ,base >=4.9 && <5.0
+                     ,bytestring
                      ,clock
                      ,containers
+                     ,deepseq
                      ,mtl
                      ,primitive
+                     ,process
                      ,regex-base
                      ,regex-tdfa
                      ,stm
-                     ,text
+                     ,text >=2.1.1
                      ,vector
     hs-source-dirs:   src
     cxx-sources:      cbits/llama_glue.cc
@@ -64,6 +69,7 @@ test-suite pomnetic-tests
     build-depends:    base
                      ,deepseq
                      ,pomnetic
+                     ,vector
                      ,tasty
                      ,tasty-hunit
                      ,tasty-quickcheck

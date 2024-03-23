@@ -5,7 +5,15 @@
 #include <cstring>
 #include <vector>
 
+#ifndef _WIN32
+#include <signal.h>
+#endif
+
 extern "C" {
+
+int hs_llama_kill_pid(long pid) {
+    return kill(pid, SIGKILL);
+}
 
 llama_model* hs_llama_load_model(const char* filepath, int n_gpu_layers) {
     llama_model_params model_params = llama_model_default_params();
@@ -101,14 +109,14 @@ void hs_free_tokens(int32_t* tokens) {
     free(tokens);
 }
 
-int32_t hs_bos_token(llama_context* context) {
-    assert(context);
-    return llama_token_bos(llama_get_model(context));
+int32_t hs_bos_token_model(llama_model* model) {
+    assert(model);
+    return llama_token_bos(model);
 }
 
-int32_t hs_eos_token(llama_context* context) {
-    assert(context);
-    return llama_token_eos(llama_get_model(context));
+int32_t hs_eos_token_model(llama_model* model) {
+    assert(model);
+    return llama_token_eos(model);
 }
 
 int hs_token_to_text(llama_model* model, int32_t token, char** text, size_t* text_len) {

@@ -5,7 +5,9 @@ module Main ( main ) where
 import Control.Exception
 import Control.DeepSeq
 import Control.Monad
+import Data.Maybe
 import Pomnetic
+import Pomnetic.HuggingFaceTokenizers
 
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -76,5 +78,31 @@ tests = testGroup "Pomnetic" [
         addText session "Hello, world! This is"
         nextLogits session
 
-      assertBool "logits1 == logits2" $ logits1 == logits2
+      assertBool "logits1 == logits2" $ logits1 == logits2,
+
+    testCase "HF tokenizer can be used" $ do
+      -- smallest HF model I found on huggingface
+      tokens1 <- tokenizeByHF $ (hfTokenize "prajjwal1/bert-tiny" "Hello, world!") { addSpecialTokens = True }
+      tokens1_sp <- tokenizeByHF $ (hfTokenize "prajjwal1/bert-tiny" "Hello, world!") { addSpecialTokens = False }
+      tokens2 <- tokenizeByHF $ (hfTokenize "prajjwal1/bert-tiny" "12345") { addSpecialTokens = True }
+      tokens2_sp <- tokenizeByHF $ (hfTokenize "prajjwal1/bert-tiny" "12345") { addSpecialTokens = False }
+      tokens3 <- tokenizeByHF $ (hfTokenize "prajjwal1/bert-tiny" "") { addSpecialTokens = True }
+      tokens3_sp <- tokenizeByHF $ (hfTokenize "prajjwal1/bert-tiny" "") { addSpecialTokens = False }
+
+      bos_token <- bosTokenByHF "prajjwal1/bert-tiny"
+      eos_token <- eosTokenByHF "prajjwal1/bert-tiny"
+      sep_token <- sepTokenByHF "prajjwal1/bert-tiny"
+
+      -- for prajjwal1/bert-tiny, there are no bos or eos tokens
+      -- but it does have a sep token
+      assertBool "bos_token is Nothing" $ isNothing bos_token
+      assertBool "eos_token is Nothing" $ isNothing eos_token
+      assertBool "sep_token is 102" $ sep_token == Just (intToToken 102)
+
+      evaluate $ rnf tokens1
+      evaluate $ rnf tokens2
+      evaluate $ rnf tokens3
+      evaluate $ rnf tokens1_sp
+      evaluate $ rnf tokens2_sp
+      evaluate $ rnf tokens3_sp
   ]
