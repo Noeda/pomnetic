@@ -76,6 +76,22 @@ def main():
             sys.stdout.buffer.write((f'\n{MAGIC} {json.dumps(answer)}\n').encode('utf-8'))
             sys.stdout.buffer.flush()
 
+        elif val['type'] == 'token_to_text':
+            model = val['model']
+
+            key = (model, False, False)
+            now = time.monotonic()
+            if key not in loaded_tokenizers:
+                loaded_tokenizers[key] = (transformers.AutoTokenizer.from_pretrained(model), now)
+
+            token = val['token']
+            text = loaded_tokenizers[key][0].decode(token)
+
+            answer = { 'py_token_to_text': text }
+
+            sys.stdout.buffer.write((f'\n{MAGIC} {json.dumps(answer)}\n').encode('utf-8'))
+            sys.stdout.buffer.flush()
+
         elif val['type'] == 'tokenize':
             tokenize_text = val['text']
             model = val['model']
@@ -102,6 +118,11 @@ def main():
             answer = { 'tokens': tokenized }
             sys.stdout.buffer.write((f'\n{MAGIC} {json.dumps(answer)}\n').encode('utf-8'))
             sys.stdout.buffer.flush()
+
+        else:
+            sys.stderr.write("Unknown message type: " + val['type'] + "\n")
+            sys.stderr.flush()
+            sys.exit(-1)
 
 if __name__ == '__main__':
     main()
