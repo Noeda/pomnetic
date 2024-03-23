@@ -65,7 +65,7 @@ def main():
             key = (model, False, False)
             now = time.monotonic()
             if key not in loaded_tokenizers:
-                loaded_tokenizers[key] = (transformers.AutoTokenizer.from_pretrained(model), now)
+                loaded_tokenizers[key] = (transformers.AutoTokenizer.from_pretrained(model, local_files_only=False, trust_remote_code=False), now)
 
             bos_token = loaded_tokenizers[key][0].bos_token_id
             eos_token = loaded_tokenizers[key][0].eos_token_id
@@ -82,9 +82,12 @@ def main():
             key = (model, False, False)
             now = time.monotonic()
             if key not in loaded_tokenizers:
-                loaded_tokenizers[key] = (transformers.AutoTokenizer.from_pretrained(model), now)
+                loaded_tokenizers[key] = (transformers.AutoTokenizer.from_pretrained(model, local_files_only=False, trust_remote_code=False), now)
 
             token = val['token']
+            if not isinstance(token, list):
+                token = [token]
+
             text = loaded_tokenizers[key][0].decode(token)
 
             answer = { 'py_token_to_text': text }
@@ -103,7 +106,7 @@ def main():
 
             key = (model, local_files_only, trust_remote_code)
             if key not in loaded_tokenizers:
-                loaded_tokenizers[key] = (transformers.AutoTokenizer.from_pretrained(model, local_files_only=local_files_only), now)
+                loaded_tokenizers[key] = (transformers.AutoTokenizer.from_pretrained(model, local_files_only=local_files_only, trust_remote_code=trust_remote_code), now)
             tokenizer, _ = loaded_tokenizers[key]
             loaded_tokenizers[key] = (tokenizer, now)
 

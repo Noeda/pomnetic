@@ -10,7 +10,7 @@ module Pomnetic.HuggingFaceTokenizers
   , hfTokenize
   , hfTokenizeEmpty
   , tokenizeByHF
-  , tokenToTextByHF
+  , tokensToTextByHF
   , bosTokenByHF
   , eosTokenByHF
   , sepTokenByHF
@@ -163,11 +163,11 @@ newtype PyTokenToTextAnswer = PyTokenToTextAnswer
   deriving (Eq, Show, Generic, FromJSON, ToJSON)
 
 -- | Convert a token into text.
-tokenToTextByHF :: FilePath -> Token -> IO Text
-tokenToTextByHF model_id token = withPyInterpreter $ \stdin stdout -> do
+tokensToTextByHF :: FilePath -> Vector Token -> IO Text
+tokensToTextByHF model_id tokens = withPyInterpreter $ \stdin stdout -> do
   let req = object [ "type" .= ("token_to_text" :: Text)
                    , "model" .= model_id
-                   , "token" .= tokenToInt token
+                   , "token" .= V.map tokenToInt tokens
                    ]
 
   let req_encoded = encode req

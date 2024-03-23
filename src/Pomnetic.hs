@@ -52,7 +52,7 @@ module Pomnetic
   -- ** Raw logits
   , nextLogits
   , Logits
-  , tokenToText
+  , tokensToText
   , intToToken
   , tokenToInt
   , vocabularySize
@@ -367,7 +367,7 @@ wholeText session = liftIO $ do
   tokens <- readIORef (generatedTokens session)
 
   let model = cmModel (sessionManager session)
-  let txt = mconcat $ fmap (tokenToText model) (V.toList tokens)
+  let txt = tokensToText model tokens
 
   return txt
 
@@ -387,7 +387,7 @@ textFrom session start = liftIO $ do
   tokens <- readIORef (generatedTokens session)
 
   let model = cmModel (sessionManager session)
-  let txt = mconcat $ fmap (tokenToText model) (V.toList $ V.drop start tokens)
+  let txt = tokensToText model (V.drop start tokens)
 
   return txt
 

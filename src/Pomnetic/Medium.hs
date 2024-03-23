@@ -68,7 +68,7 @@ module Pomnetic.Medium
   , eosToken
   , bosTokenModel
   , eosTokenModel
-  , tokenToText
+  , tokensToText
   , tokenToInt
   , intToToken
   , vocabularySize
@@ -112,6 +112,7 @@ import Data.Data
 import Data.Int
 import Data.IORef
 import Data.Maybe
+import Data.Traversable
 import Data.Word
 import GHC.Generics
 import Foreign.C.String
@@ -606,7 +607,7 @@ fillBlacklist filters ptr vocab_size model regex_filter_text = do
   go NoFilter = return []
   go (AttoparsecFilter parser) = do
     return [\token ->
-      let token_str = tokenToText model token
+      let token_str = tokensToText model (V.singleton token)
           whole = regex_filter_text <> token_str
        in do case parse parser whole of
                Fail {} -> return False
@@ -620,7 +621,7 @@ fillBlacklist filters ptr vocab_size model regex_filter_text = do
                    else return True]
   go (AttoparsecBSFilter parser) = do
     return [\token ->
-      let token_str = tokenToText model token
+      let token_str = tokensToText model (V.singleton token)
           whole = T.encodeUtf8 $ regex_filter_text <> token_str
        in do case B.parse parser whole of
                Fail {} -> return False
@@ -637,7 +638,7 @@ fillBlacklist filters ptr vocab_size model regex_filter_text = do
       Left err -> throwIO $ InvalidRegex (T.pack err)
       Right compiled -> return compiled
     return [\token ->
-       let whole = regex_filter_text <> tokenToText model token
+       let whole = regex_filter_text <> tokensToText model (V.singleton token)
         in return $ Text.Regex.Base.RegexLike.match compiled_regex whole]
 
   go (AndFilter f1 f2) = do
@@ -692,17 +693,27 @@ tokenize model txt = unsafePerformIO $ do
 
 -- | Converts a token to its text piece. May throw `InvalidToken` if the token
 -- is not valid.
-tokenToText :: Model -> Token -> Text
-tokenToText _model (Token token) | token < 0 = throw $ InvalidToken (Token token)
-tokenToText model token = unsafePerformIO $ do
+--
+-- Note: a group of tokens converted to text together can differ from
+-- individually converted tokens. Try to convert tokens en-masse.
+tokensToText :: Model -> Vector Token -> Text
+tokensToText _model tokens | Just token <- V.find (\(Token t) -> t < 0) tokens = throw $ InvalidToken token
+tokensToText model tokens = unsafePerformIO $ do
   ref <- readIORef (hfTokenizer model)
   case ref of
-    Nothing -> llamaTokenToText model token
-    Just hf -> tokenToTextByHF (hfModelID hf) token
+    Nothing -> llamaTokensToText model tokens
+    Just hf -> tokensToTextByHF (hfModelID hf) tokens
  where
+  llamaTokensToText :: Model -> Vector Token -> IO Text
+  -- no bulk conversion in llama.cpp
+  llamaTokensToText model tokens = do
+    results <- for (V.toList tokens) $ \token -> llamaTokenToText model token
+    return $ mconcat results
+
   llamaTokenToText :: Model -> Token -> IO Text
   llamaTokenToText model (Token token) = withModel model $ \model_ptr -> do
     vocab_size <- safeFromIntegral <$> c_llama_vocab_size_model model_ptr
+
     when (token >= vocab_size) $
       throwIO $ InvalidToken (Token token)
 
