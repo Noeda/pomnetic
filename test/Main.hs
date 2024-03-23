@@ -6,6 +6,7 @@ import Control.Exception
 import Control.DeepSeq
 import Control.Monad
 import Data.Maybe
+import qualified Data.Vector as V
 import Pomnetic
 import Pomnetic.HuggingFaceTokenizers
 
@@ -45,7 +46,7 @@ tests = testGroup "Pomnetic" [
     testCase "Invalid token conversion throws InvalidToken" $ do
       model <- loadModel testModel
       let invalid_token = intToToken (-123)
-      result <- try $ evaluate $ tokenToText model invalid_token
+      result <- try $ evaluate $ tokensToText model (V.singleton invalid_token)
 
       case result of
         Left (InvalidToken token) | token == invalid_token -> return ()

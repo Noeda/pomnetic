@@ -333,7 +333,7 @@ sessionModel = cmModel . sessionManager
 -- Bad things may happen if you keep the `Session` value after `withSession` is
 -- over. Only use it inside its own `withSession`.
 withSession :: MonadIO m => Manager -> (Session -> IO a) -> m a
-withSession manager action = liftIO $ withSeqIdx manager $ \seq_idx -> do
+withSession manager action = liftIO $ mask $ \restore -> withSeqIdx manager $ \seq_idx -> do
   forgetTokens (cmContext manager) seq_idx 0 (-1)
 
   pos_ref <- newIORef 0
@@ -354,9 +354,9 @@ withSession manager action = liftIO $ withSeqIdx manager $ \seq_idx -> do
                         , sessionManager = manager
                         , sessionSeqIdx = seq_idx }
 
-  result <- action session
-
-  forgetTokens (cmContext manager) seq_idx 0 (-1)
+  result <- finally
+    (restore $ action session)
+    (forgetTokens (cmContext manager) seq_idx 0 (-1))
 
   return result
 
