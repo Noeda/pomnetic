@@ -1,3 +1,6 @@
+{-# LANGUAGE TypeSynonymInstances #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 
 --
@@ -27,7 +30,7 @@
 -- come after that token.
 --
 -- Use `processBatch` to instruct the system to process the batch. Afterwards,
--- you can use `getLogits` to get probabilities for every token.
+-- you can use `getLogits` to get probabilities for your tokens.
 --
 -- You can use `sampleMirostat` to sample a token from the logits. (or you can
 -- also do sampling yourself). For next generation, you could make a batch with
@@ -90,12 +93,15 @@ module Pomnetic.Medium
   , createBatch
   , batchLength
   , setBatchItem
+  , BatchItemIdx
   , setBatchLength
   , processBatch
   , SeqID
   -- * Sampling
   , Logits
   , getLogits
+  , SoftmaxLogitsable(..)
+  , sortLogits
   -- ** Mirostat sampling
   , MirostatConfig(..)
   , mirostatConfig
@@ -125,11 +131,13 @@ import Foreign.Storable
 import Foreign.C.Types
 import Data.Attoparsec.Text
 import qualified Data.Attoparsec.ByteString as B
+import Data.Ord
 import Data.Text ( Text )
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
-import Data.Vector ( Vector )
-import qualified Data.Vector as V
+import Data.Unique
+import qualified Data.Vector.Unboxed as VU
+import qualified Data.Vector.Algorithms.Heap as VUA
 import Pomnetic.Error
 import Pomnetic.HuggingFaceTokenizers
 import Pomnetic.Safe ( safeFromIntegral )
@@ -176,7 +184,9 @@ foreign import ccall unsafe "hs_set_batch_item" c_llama_set_batch_item
 foreign import ccall unsafe "hs_set_batch_length" c_llama_set_batch_length :: Ptr CBatch -> CInt -> IO ()
 
 foreign import ccall "hs_decode" c_llama_decode :: Ptr CContext -> Ptr CBatch -> IO CInt
-foreign import ccall unsafe "hs_get_logits" c_llama_get_logits :: Ptr CContext -> CInt -> Ptr CFloat -> IO ()
+foreign import ccall unsafe "hs_get_logits_from_hs_batch" c_llama_get_logits_from_hs_batch :: Ptr CBatch -> CInt -> Ptr CFloat -> IO ()
+foreign import ccall unsafe "hs_batch_has_logits" c_hs_batch_has_logits :: Ptr CBatch -> CInt -> IO CInt
+foreign import ccall unsafe "hs_get_logits_len_from_hs_batch" c_hs_get_logits_len_from_hs_batch :: Ptr CBatch -> CInt -> IO CSize
 foreign import ccall unsafe "hs_get_vocab_size" c_llama_vocab_size :: Ptr CContext -> IO CInt
 foreign import ccall unsafe "hs_get_vocab_size_model" c_llama_vocab_size_model :: Ptr CModel -> IO CInt
 foreign import ccall "hs_sample_mirostat" c_llama_sample_mirostat :: Ptr CContext -> Ptr CFloat -> Ptr CFloat -> Ptr Word8 -> CFloat -> CFloat -> IO Int32
@@ -188,8 +198,17 @@ vocabularySize model = unsafePerformIO $ withModel model $ \model_ptr -> do
   vocab_size <- c_llama_vocab_size_model model_ptr
   return $ fromIntegral vocab_size
 
-newtype Batch = Batch (ForeignPtr CBatch)
-  deriving ( Eq, Ord, Show )
+-- Batch uniq capacity mvar
+data Batch = Batch !Unique !Int (MVar (ForeignPtr CBatch))
+
+instance Eq Batch where
+  Batch uniq1 _ _ == Batch uniq2 _ _ = uniq1 == uniq2
+
+instance Ord Batch where
+  Batch uniq1 _ _ `compare` Batch uniq2 _ _ = uniq1 `compare` uniq2
+
+instance Show Batch where
+  show (Batch uniq sz _) = "<#Batch " <> show (hashUnique uniq) <> " " <> show sz <> ">"
 
 data CContext
 data CModel
@@ -308,7 +327,7 @@ getContextLengthFromMetadata model = liftIO $ withModel model $ \model_ptr -> do
     then Nothing
     else Just $ safeFromIntegral context_length
 
--- | Given a model path, returns sensible default settings.
+-- | Given a model, returns sensible default settings.
 --
 -- This attempts to read context length from the model. Otherwise behaves same
 -- as `makeSensibleDefaultContextSettingsFromContextLength`.
@@ -383,7 +402,10 @@ createBatch sz = liftIO $ mask_ $ do
   when (batch == nullPtr) $
     pomneticError "Failed to create batch"
   fptr_batch <- newForeignPtr fptr_c_llama_free_batch batch
-  return $ Batch fptr_batch
+  mvar <- newMVar fptr_batch
+
+  uniq <- newUnique
+  return $ Batch uniq sz mvar
 
 type SeqID = Int
 
@@ -410,14 +432,18 @@ data BatchItem = BatchItem
 -- Use `getLogits` to get the logits of a batch, with index matching which
 -- index you used in `setBatchItem`.
 processBatch :: MonadIO m => Context -> Batch -> m ()
-processBatch ctx (Batch fptr_batch) = liftIO $ withForeignPtr fptr_batch $ \ptr -> do
-  withContext ctx $ \ctx_ptr -> do
-    result <- c_llama_decode ctx_ptr ptr
-    when (result > 0) $
-      throwIO TooLongText
+processBatch ctx batch@(Batch _ batch_capacity batch_mvar) = liftIO $ do
+  withMVar batch_mvar $ \batch_fptr -> withForeignPtr batch_fptr $ \batch_ptr -> do
+    withContext ctx $ \ctx_ptr -> do
+      result <- c_llama_decode ctx_ptr batch_ptr
+      -- FIXME: bad magic number
+      when (result == 81273997) $
+        pomneticError $ "calloc() failed."
+      when (result > 0) $
+        throwIO TooLongText
 
-    when (result < 0) $
-      pomneticError "Failed to decode"
+      when (result < 0) $
+        pomneticError "Failed to decode"
 
 -- | Makes the context forget tokens in the given range, for the given
 -- sequence.
@@ -431,11 +457,13 @@ forgetTokens :: MonadIO m => Context -> SeqID -> Int -> Int -> m ()
 forgetTokens ctx seq_id start end = liftIO $ withContext ctx $ \ctx_ptr ->
   c_llama_remove_tokens ctx_ptr (safeFromIntegral seq_id) (safeFromIntegral start) (safeFromIntegral end)
 
-setBatchItem :: Batch -> BatchItem -> Int -> IO ()
-setBatchItem batch@(Batch fptr_batch) item sz =
+type BatchItemIdx = Int
+
+setBatchItem :: Batch -> BatchItem -> BatchItemIdx -> IO ()
+setBatchItem batch@(Batch _ len mvar) item sz =
   if sz >= len
     then pomneticError $ "Batch size must be less than " <> show len
-    else withForeignPtr fptr_batch $ \batch_ptr ->
+    else withMVar mvar $ \fptr_batch -> withForeignPtr fptr_batch $ \batch_ptr ->
       let Token tk = token item
        in c_llama_set_batch_item batch_ptr
                                  (safeFromIntegral sz)
@@ -445,37 +473,104 @@ setBatchItem batch@(Batch fptr_batch) item sz =
                                  (if logits item
                                    then 1
                                    else 0)
- where
-  len = batchCapacity batch
 
 batchCapacity :: Batch -> Int
-batchCapacity (Batch fptr) = unsafePerformIO $ withForeignPtr fptr $ \ptr ->
-  safeFromIntegral <$> c_llama_batch_capacity ptr
+batchCapacity (Batch _ capacity _) = capacity
 
 batchLength :: MonadIO m => Batch -> m Int
-batchLength (Batch fptr) = liftIO $ withForeignPtr fptr $ \ptr ->
+batchLength (Batch _ _ mvar) = liftIO $ withMVar mvar $ \fptr -> withForeignPtr fptr $ \ptr ->
   safeFromIntegral <$> c_llama_batch_length ptr
 
 setBatchLength :: MonadIO m => Batch -> Int -> m ()
-setBatchLength batch@(Batch fptr) len =
+setBatchLength (Batch _ cap mvar) len =
   if len > cap || len < 0
     then pomneticError $ "Batch length must be less than " <> show cap
-    else liftIO $ withForeignPtr fptr $ \ptr ->
+    else liftIO $ withMVar mvar $ \fptr -> withForeignPtr fptr $ \ptr ->
            c_llama_set_batch_length ptr (safeFromIntegral len)
- where
-  cap = batchCapacity batch
 
 vocabSize :: Context -> Int
 vocabSize (Context _ _ vocab_size) = vocab_size
 
-type Logits = Vector Float
+type Logits = VU.Vector Float
 
-getLogits :: MonadIO m => Context -> Int -> m Logits
-getLogits ctx idx =
-  liftIO $ withContext ctx $ \ctx_ptr ->
-    allocaArray (vocabSize ctx) $ \logits_ptr -> do
-      c_llama_get_logits ctx_ptr (safeFromIntegral idx) logits_ptr
-      V.fromList . fmap cfloatToFloat <$> peekArray (vocabSize ctx) logits_ptr
+-- | Gets logits for a batch item. The integer refers to the index as used in
+-- the last argument of `setBatchItem`.
+--
+-- Throws `BatchItemIdxHasNoLogits` if the batch item does not have logits.
+getLogits :: MonadIO m => Batch -> BatchItemIdx -> m Logits
+getLogits (Batch _ _ mvar) idx = liftIO $ withMVar mvar $ \fbatch_ptr -> withForeignPtr fbatch_ptr $ \batch_ptr -> do
+  -- c_hs_batch_has_logits checks for range too; returns zero if no logits
+  has_logits <- c_hs_batch_has_logits batch_ptr (safeFromIntegral idx)
+  when (has_logits == 0) $
+    throwIO BatchItemIdxHasNoLogits
+
+  vocab_size <- safeFromIntegral <$> c_hs_get_logits_len_from_hs_batch batch_ptr (safeFromIntegral idx)
+
+  allocaArray vocab_size $ \logits_ptr -> do
+    --c_llama_get_logits ctx_ptr (safeFromIntegral idx) logits_ptr
+    c_llama_get_logits_from_hs_batch batch_ptr (safeFromIntegral idx) logits_ptr
+    VU.fromList . fmap cfloatToFloat <$> peekArray vocab_size logits_ptr
+
+-- | A utility function to take `Logits`, sort them, and return the sorted
+-- `Logits`. The sorted list contains an index that determines the token ID.
+-- (in `Logits` the token ID is implied by the position of the logit in the
+-- vector).
+sortLogits :: Logits -> VU.Vector (Token, Float)
+sortLogits logits = unsafePerformIO $ do
+  thawed <- VU.unsafeThaw $ VU.map (\(x, y) -> (intToToken $ fromIntegral x, y)) $ VU.indexed logits
+  -- VUA is currently heap-sort (keeps it stable)
+  VUA.sortBy (\(_, a) (_, b) -> compare b a) thawed
+  VU.unsafeFreeze thawed
+
+class SoftmaxLogitsable a where
+  softmaxLogits :: a -> a
+
+instance SoftmaxLogitsable Logits where
+  {-# INLINE softmaxLogits #-}
+  softmaxLogits = softmaxLogitsLogits
+
+instance SoftmaxLogitsable (VU.Vector (Token, Float)) where
+  {-# INLINE softmaxLogits #-}
+  softmaxLogits = softmaxLogitsTokenFloat
+
+-- | A utility function to take `Logits` and convert them to probabilities.
+--
+-- Does this operation: `exp(logits) / sum(exp(logits))` (with the exp accuracy
+-- numerical trick of subtracting the maximum value from the logits).
+softmaxLogitsLogits :: Logits -> Logits
+softmaxLogitsLogits logits | VU.null logits = VU.empty
+softmaxLogitsLogits logits | VU.length logits == 1 = VU.singleton 1.0
+softmaxLogitsLogits logits =
+  let max_value = VU.maximum logits
+      exps = VU.map (\x -> exp (x - max_value)) logits
+      -- Normally there is just VU.sum.
+      -- sum_exps = VU.sum exps
+      sum_exps = dvdSum exps
+   in VU.map (/ sum_exps) exps
+
+-- | Same as softmaxLogitsLogits but for (Token, Float) input.
+softmaxLogitsTokenFloat :: VU.Vector (Token, Float) -> VU.Vector (Token, Float)
+softmaxLogitsTokenFloat logits | VU.null logits = VU.empty
+softmaxLogitsTokenFloat logits | VU.length logits == 1 = VU.singleton (fst (VU.head logits), 1.0)
+softmaxLogitsTokenFloat logits =
+  let max_value = VU.maximumBy (comparing snd) logits
+      exps = VU.map (\(tk, x) -> (tk, exp (x - snd max_value))) logits
+      sum_exps = dvdSum $ VU.map snd exps
+   in VU.map (\(tk, x) -> (tk, x / sum_exps)) exps
+
+{-# INLINE dvdSum #-}
+dvdSum :: (VU.Unbox a, Num a) => VU.Vector a -> a
+dvdSum !vec | VU.null vec = 0
+dvdSum !vec | VU.length vec == 1 = VU.head vec
+dvdSum !vec | VU.length vec == 2 = VU.head vec + VU.last vec
+dvdSum !vec | VU.length vec == 3 = (vec VU.! 0) + (vec VU.! 1) + (vec VU.! 2)
+dvdSum !vec | VU.length vec == 4 =
+  ((vec VU.! 0) + (vec VU.! 1)) +
+  ((vec VU.! 2) + (vec VU.! 3))
+dvdSum !vec =
+  let left_side = VU.take (VU.length vec `div` 2) vec
+      right_side = VU.drop (VU.length vec `div` 2) vec
+   in dvdSum left_side + dvdSum right_side
 
 -- | Filters constraint what the model can output.
 --
@@ -554,13 +649,13 @@ mirostatConfig :: Float -> Float -> MirostatConfig
 mirostatConfig tau eta = MirostatConfig tau eta
 
 sampleMirostat :: MonadIO m => Context -> Logits -> MirostatMu -> Filters -> MirostatConfig -> RegexFilterText -> m (Token, MirostatMu)
-sampleMirostat ctx logits _mu _filters _config _regex_filter_text | V.length logits /= vocabSize ctx =
+sampleMirostat ctx logits _mu _filters _config _regex_filter_text | VU.length logits /= vocabSize ctx =
   pomneticError "Logits size must be equal to vocab size"
 sampleMirostat ctx@(Context _ model vocab_size) logits mu filters config regex_filter_text = liftIO $ withContext ctx $ \ctx_ptr ->
-  allocaArray (V.length logits) $ \logits_ptr -> do
-    pokeArray logits_ptr (fmap realToFrac $ V.toList logits)
+  allocaArray (VU.length logits) $ \logits_ptr -> do
+    pokeArray logits_ptr (fmap realToFrac $ VU.toList logits)
     alloca $ \mu_ptr -> do
-      allocaArray (V.length logits) $ \blacklist_ptr -> do
+      allocaArray (VU.length logits) $ \blacklist_ptr -> do
         test_fun <- fillBlacklist filters blacklist_ptr vocab_size model regex_filter_text
 
         let sample_token = do poke mu_ptr (CFloat mu)
@@ -607,7 +702,7 @@ fillBlacklist filters ptr vocab_size model regex_filter_text = do
   go NoFilter = return []
   go (AttoparsecFilter parser) = do
     return [\token ->
-      let token_str = tokensToText model (V.singleton token)
+      let token_str = tokensToText model (VU.singleton token)
           whole = regex_filter_text <> token_str
        in do case parse parser whole of
                Fail {} -> return False
@@ -621,7 +716,7 @@ fillBlacklist filters ptr vocab_size model regex_filter_text = do
                    else return True]
   go (AttoparsecBSFilter parser) = do
     return [\token ->
-      let token_str = tokensToText model (V.singleton token)
+      let token_str = tokensToText model (VU.singleton token)
           whole = T.encodeUtf8 $ regex_filter_text <> token_str
        in do case B.parse parser whole of
                Fail {} -> return False
@@ -638,7 +733,7 @@ fillBlacklist filters ptr vocab_size model regex_filter_text = do
       Left err -> throwIO $ InvalidRegex (T.pack err)
       Right compiled -> return compiled
     return [\token ->
-       let whole = regex_filter_text <> tokensToText model (V.singleton token)
+       let whole = regex_filter_text <> tokensToText model (VU.singleton token)
         in return $ Text.Regex.Base.RegexLike.match compiled_regex whole]
 
   go (AndFilter f1 f2) = do
@@ -663,14 +758,14 @@ cfloatToFloat :: CFloat -> Float
 cfloatToFloat = realToFrac
 
 -- | Tokenizes a text. Does not add special tokens (like bos or eos).
-tokenize :: Model -> Text -> Vector Token
+tokenize :: Model -> Text -> VU.Vector Token
 tokenize model txt = unsafePerformIO $ do
   ref <- readIORef (hfTokenizer model)
   case ref of
     Nothing -> llamaTokenize model txt
     Just hf -> tokenizeByHF hf { addSpecialTokens = False, textToTokenize = txt }
  where
-  llamaTokenize :: Model -> Text -> IO (Vector Token)
+  llamaTokenize :: Model -> Text -> IO (VU.Vector Token)
   llamaTokenize model txt =
     withModel model $ \model_ptr -> 
       withCString (T.unpack txt) $ \str -> mask_ $
@@ -683,7 +778,7 @@ tokenize model txt = unsafePerformIO $ do
           ntokens <- peek tokens_sz_ptr
           tokens_ptr <- peek tokens_ptr_ptr
 
-          tokens <- V.generateM (safeFromIntegral ntokens) $ \idx -> do
+          tokens <- VU.generateM (safeFromIntegral ntokens) $ \idx -> do
             val <- peekElemOff tokens_ptr idx
             return $ Token $ safeFromIntegral val
 
@@ -694,20 +789,23 @@ tokenize model txt = unsafePerformIO $ do
 -- | Converts a token to its text piece. May throw `InvalidToken` if the token
 -- is not valid.
 --
+-- Also note: there is no guarantee that every token has a valid unicode text
+-- piece, depending on how it implements tokenization.
+--
 -- Note: a group of tokens converted to text together can differ from
 -- individually converted tokens. Try to convert tokens en-masse.
-tokensToText :: Model -> Vector Token -> Text
-tokensToText _model tokens | Just token <- V.find (\(Token t) -> t < 0) tokens = throw $ InvalidToken token
+tokensToText :: Model -> VU.Vector Token -> Text
+tokensToText _model tokens | Just token <- VU.find (\(Token t) -> t < 0) tokens = throw $ InvalidToken token
 tokensToText model tokens = unsafePerformIO $ do
   ref <- readIORef (hfTokenizer model)
   case ref of
     Nothing -> llamaTokensToText model tokens
     Just hf -> tokensToTextByHF (hfModelID hf) tokens
  where
-  llamaTokensToText :: Model -> Vector Token -> IO Text
+  llamaTokensToText :: Model -> VU.Vector Token -> IO Text
   -- no bulk conversion in llama.cpp
   llamaTokensToText model tokens = do
-    results <- for (V.toList tokens) $ \token -> llamaTokenToText model token
+    results <- for (VU.toList tokens) $ \token -> llamaTokenToText model token
     return $ mconcat results
 
   llamaTokenToText :: Model -> Token -> IO Text
@@ -726,6 +824,7 @@ tokensToText model tokens = unsafePerformIO $ do
       str <- peek str_ptr
       str_len <- peek str_len_ptr
 
+      -- TODO: peekCStringLen uses current locale, which is not necessarily UTF-8
       result <- peekCStringLen (str, safeFromIntegral str_len)
       c_llama_free_text str
 

@@ -16,6 +16,7 @@ data PomneticError
   | NoRequestedTokenExists -- thrown when bos or eos was asked and model doesn ot have any.
   | TooLongText
   | AllTokensRejected
+  | BatchItemIdxHasNoLogits
   | InvalidRegex !Text   -- text will contain human-readable message
   | InvalidToken !Token
   deriving ( Eq, Ord, Show, Data, Typeable, Generic )

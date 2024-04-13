@@ -24,8 +24,7 @@ import Data.Text ( Text )
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.Text.IO.Utf8 as T
-import Data.Vector ( Vector )
-import qualified Data.Vector as V
+import qualified Data.Vector.Unboxed as VU
 import Control.Concurrent
 import Control.Exception
 import Data.Maybe
@@ -127,7 +126,7 @@ data PyTokenizerAnswer = PyTokenizerAnswer
 --
 -- The tokenizer will be kept in memory so that further calls with the same
 -- model are fast.
-tokenizeByHF :: HFTokenize -> IO (Vector Token)
+tokenizeByHF :: HFTokenize -> IO (VU.Vector Token)
 tokenizeByHF tokenize = withPyInterpreter $ \stdin stdout -> do
   let req = object [ "type" .= ("tokenize" :: Text)
                    , "model" .= hfModelID tokenize
@@ -145,7 +144,7 @@ tokenizeByHF tokenize = withPyInterpreter $ \stdin stdout -> do
 
   waitForAnswer stdout
  where
-  waitForAnswer :: Handle -> IO (Vector Token)
+  waitForAnswer :: Handle -> IO (VU.Vector Token)
   waitForAnswer h = do
     line <- T.strip <$> T.hGetLine h
     if T.isPrefixOf magic line
@@ -153,7 +152,7 @@ tokenizeByHF tokenize = withPyInterpreter $ \stdin stdout -> do
         let answer = T.drop (T.length magic+1) line
         case decodeStrict' $ T.encodeUtf8 answer of
           Just (PyTokenizerAnswer tokens) -> do
-            return $ V.fromList $ fmap intToToken tokens
+            return $ VU.fromList $ fmap intToToken tokens
           _ -> throwIO $ userError $ "Invalid answer from Python: " <> show answer
       else waitForAnswer h
 
@@ -163,11 +162,11 @@ newtype PyTokenToTextAnswer = PyTokenToTextAnswer
   deriving (Eq, Show, Generic, FromJSON, ToJSON)
 
 -- | Convert a token into text.
-tokensToTextByHF :: FilePath -> Vector Token -> IO Text
+tokensToTextByHF :: FilePath -> VU.Vector Token -> IO Text
 tokensToTextByHF model_id tokens = withPyInterpreter $ \stdin stdout -> do
   let req = object [ "type" .= ("token_to_text" :: Text)
                    , "model" .= model_id
-                   , "token" .= V.map tokenToInt tokens
+                   , "token" .= VU.map tokenToInt tokens
                    ]
 
   let req_encoded = encode req

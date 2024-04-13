@@ -147,12 +147,34 @@ void hs_free_text(char* text) {
 typedef struct hs_batch
 {
     int capacity;
+
+    // stores logits; if requested.
+    // always same size as capacity but some entries can be null, or
+    // allocated/freed on the fly when the batch is used again.
+    //
+    // not to be confused with llama_batch.logits which just indicates if
+    // logits will be calculated.
+    float** logits;
+    // stores lengths of logits
+    size_t* logits_len;
+
     llama_batch batch;
 } hs_batch;
 
 hs_batch* hs_create_batch(int sz) {
     hs_batch* b = (hs_batch*) calloc(1, sizeof(hs_batch));
     if (!b) {
+        return 0;
+    }
+    b->logits = (float**) calloc(sz, sizeof(float*));
+    if (!b->logits) {
+        free(b);
+        return 0;
+    }
+    b->logits_len = (size_t*) calloc(sz, sizeof(size_t));
+    if (!b->logits_len) {
+        free(b->logits);
+        free(b);
         return 0;
     }
     b->batch = llama_batch_init(sz, 0, 1);
@@ -189,6 +211,13 @@ void hs_free_batch(hs_batch* batch) {
     if (!batch) {
         return;
     }
+    if (batch->logits) {
+        for (int i = 0; i < batch->capacity; i++) {
+            free(batch->logits[i]);
+        }
+        free(batch->logits);
+    }
+    free(batch->logits_len);
     llama_batch_free(batch->batch);
 }
 
@@ -200,12 +229,6 @@ int hs_batch_capacity(hs_batch* batch) {
 int hs_batch_length(hs_batch* batch) {
     assert(batch);
     return batch->batch.n_tokens;
-}
-
-int hs_decode(llama_context* ctx, hs_batch* batch) {
-    assert(ctx);
-    assert(batch);
-    return llama_decode(ctx, batch->batch);
 }
 
 int hs_get_vocab_size_model(llama_model* model) {
@@ -226,6 +249,114 @@ void hs_get_logits(llama_context* ctx, int idx, float* logits) {
 
     float* l = llama_get_logits_ith(ctx, idx);
     memcpy(logits, l, sizeof(float) * hs_get_vocab_size(ctx));
+}
+
+int hs_decode(llama_context* ctx, hs_batch* batch) {
+    assert(ctx);
+    assert(batch);
+
+    for (int i = 0; i < batch->batch.n_tokens; ++i) {
+        if (batch->batch.logits[i]) {
+            if (!batch->logits[i]) {
+                batch->logits[i] = (float*) calloc(hs_get_vocab_size(ctx), sizeof(float));
+                if (!batch->logits[i]) {
+                    // FIXME: bad magic number
+                    return 81273997;
+                }
+            } else {
+                memset(batch->logits[i], 0, hs_get_vocab_size(ctx) * sizeof(float));
+            }
+            batch->logits_len[i] = hs_get_vocab_size(ctx);
+        } else {
+            free(batch->logits[i]);
+            batch->logits[i] = 0;
+            batch->logits_len[i] = 0;
+        }
+    }
+
+    uint32_t cbatch_size = llama_n_batch(ctx);
+
+    // do we need to split the batch?
+    if (batch->batch.n_tokens > cbatch_size) {
+        uint32_t tokens_left = batch->batch.n_tokens;
+        uint32_t cursor = 0;
+        llama_batch subbatch;
+        subbatch = llama_batch_init(cbatch_size, 0, 1);
+
+        while (tokens_left > 0) {
+            subbatch.n_tokens = (tokens_left > cbatch_size) ? cbatch_size : tokens_left;
+            memcpy(subbatch.token, &batch->batch.token[cursor], subbatch.n_tokens * sizeof(llama_token));
+            memcpy(subbatch.n_seq_id, &batch->batch.n_seq_id[cursor], subbatch.n_tokens * sizeof(int32_t));
+            for (int token_idx = 0; token_idx < subbatch.n_tokens; token_idx++) {
+                subbatch.seq_id[token_idx][0] = batch->batch.seq_id[cursor + token_idx][0];
+            }
+            memcpy(subbatch.pos, &batch->batch.pos[cursor], subbatch.n_tokens * sizeof(llama_pos));
+            memcpy(subbatch.logits, &batch->batch.logits[cursor], subbatch.n_tokens * sizeof(int8_t));
+
+            int result = llama_decode(ctx, subbatch);
+            if (result != 0) {
+                llama_batch_free(subbatch);
+                return result;
+            }
+            for (int token_idx = 0; token_idx < subbatch.n_tokens; token_idx++) {
+                if (subbatch.logits[token_idx]) {
+                    assert(batch->logits[cursor + token_idx]);
+                    hs_get_logits(ctx, token_idx, batch->logits[cursor + token_idx]);
+                }
+            }
+
+            memcpy(&batch->batch.token[cursor], subbatch.token, subbatch.n_tokens * sizeof(llama_token));
+            memcpy(&batch->batch.n_seq_id[cursor], subbatch.n_seq_id, subbatch.n_tokens * sizeof(int32_t));
+            for (int token_idx = 0; token_idx < subbatch.n_tokens; token_idx++) {
+                batch->batch.seq_id[cursor + token_idx][0] = subbatch.seq_id[token_idx][0];
+            }
+            memcpy(&batch->batch.pos[cursor], subbatch.pos, subbatch.n_tokens * sizeof(llama_pos));
+            memcpy(&batch->batch.logits[cursor], subbatch.logits, subbatch.n_tokens * sizeof(int8_t));
+
+            tokens_left -= subbatch.n_tokens;
+            cursor += subbatch.n_tokens;
+        }
+
+        llama_batch_free(subbatch);
+        return 0;
+    } else {
+        int result = llama_decode(ctx, batch->batch);
+        if (result != 0) {
+            return result;
+        }
+
+        for (int token_idx = 0; token_idx < batch->batch.n_tokens; token_idx++) {
+            if (batch->batch.logits[token_idx]) {
+                assert(batch->logits[token_idx]);
+                hs_get_logits(ctx, token_idx, batch->logits[token_idx]);
+            }
+        }
+
+        return 0;
+    }
+}
+
+int hs_batch_has_logits(hs_batch* batch, int idx) {
+    assert(batch);
+    if (idx < 0 || idx >= batch->capacity) {
+        return 0;
+    }
+    return batch->batch.logits[idx];
+}
+
+void hs_get_logits_from_hs_batch(hs_batch* batch, int idx, float* logits) {
+    assert(batch);
+    assert(logits);
+    assert(batch->logits);
+    assert(batch->logits[idx]);
+
+    memcpy(logits, batch->logits[idx], sizeof(float) * batch->logits_len[idx]);
+}
+
+size_t hs_get_logits_len_from_hs_batch(hs_batch* batch, int idx) {
+    assert(batch);
+    assert(batch->logits_len);
+    return batch->logits_len[idx];
 }
 
 int32_t hs_sample_mirostat(llama_context* ctx,

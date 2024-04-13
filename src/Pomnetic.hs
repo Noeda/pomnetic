@@ -52,6 +52,8 @@ module Pomnetic
   -- ** Raw logits
   , nextLogits
   , Logits
+  , SoftmaxLogitsable(..)
+  , sortLogits
   , tokensToText
   , intToToken
   , tokenToInt
@@ -84,8 +86,7 @@ import qualified Data.IntSet as IS
 import Data.Maybe ( fromJust )
 import qualified Data.Sequence as SQ
 import Data.Text ( Text )
-import Data.Vector ( Vector )
-import qualified Data.Vector as V
+import qualified Data.Vector.Unboxed as VU
 import GHC.Generics
 import Pomnetic.HuggingFaceTokenizers
 import Pomnetic.Medium
@@ -315,8 +316,8 @@ withSeqIdx manager action = mask $ \restore -> do
 data Session = Session
   { posRef :: !(IORef Int)
   , sessionMu :: !(IORef Float)
-  , generatedTokens :: !(IORef (Vector Token))
-  , wantedTokens :: !(IORef (Vector Token))
+  , generatedTokens :: !(IORef (VU.Vector Token))
+  , wantedTokens :: !(IORef (VU.Vector Token))
   , logitsTVar :: !(TVar (Maybe Logits))
   , sessionManager :: !Manager
   , sessionSeqIdx :: !Int }
@@ -343,8 +344,8 @@ withSession manager action = liftIO $ mask $ \restore -> withSeqIdx manager $ \s
 
   let bos = bosToken (cmContext manager)
 
-  gen_ref <- newIORef V.empty
-  wanted_ref <- newIORef $ V.singleton bos
+  gen_ref <- newIORef VU.empty
+  wanted_ref <- newIORef $ VU.singleton bos
 
   let session = Session { posRef = pos_ref
                         , sessionMu = mu_ref
@@ -374,11 +375,11 @@ wholeText session = liftIO $ do
 -- | Returns the current text in the session, in the form of tokens.
 --
 -- Does not include the BOS token.
-wholeTokens :: MonadIO m => Session -> m (Vector Token)
+wholeTokens :: MonadIO m => Session -> m (VU.Vector Token)
 wholeTokens session = liftIO $ do
   applyWantedTokens session
   result <- readIORef (generatedTokens session)
-  return $ V.tail result
+  return $ VU.tail result
 
 -- | Returns text starting from a certain index (in tokens).
 textFrom :: MonadIO m => Session -> Int -> m Text
@@ -387,7 +388,7 @@ textFrom session start = liftIO $ do
   tokens <- readIORef (generatedTokens session)
 
   let model = cmModel (sessionManager session)
-  let txt = tokensToText model (V.drop start tokens)
+  let txt = tokensToText model (VU.drop start tokens)
 
   return txt
 
@@ -414,7 +415,7 @@ generateConfig ntokens = GenerateConfig
 generateText :: MonadIO m => Session -> GenerateConfig -> m ()
 generateText session config = liftIO $ do
   applyWantedTokens session
-  n_tokens_generated <- fmap V.length $ readIORef (generatedTokens session)
+  n_tokens_generated <- fmap VU.length $ readIORef (generatedTokens session)
   generateText2 session config n_tokens_generated
 
 -- | Returns logits for what would be the next token.
@@ -448,8 +449,8 @@ generateText2 session config n_tokens_generated = liftIO $ do
 
   writeIORef (sessionMu session) new_mu
 
-  modifyIORef' (generatedTokens session) $ \vec -> vec <> V.singleton new_token
-  modifyIORef' (wantedTokens session) $ \vec -> vec <> V.singleton new_token
+  modifyIORef' (generatedTokens session) $ \vec -> vec <> VU.singleton new_token
+  modifyIORef' (wantedTokens session) $ \vec -> vec <> VU.singleton new_token
 
   original_pos <- readIORef (posRef session)
   gen_vec <- readIORef (generatedTokens session)
@@ -464,14 +465,14 @@ generateText2 session config n_tokens_generated = liftIO $ do
                           writeIORef (posRef session) (pos+1)
 
                           idx <- set_item (BatchItem {
-                                       token = V.last gen_vec,
+                                       token = VU.last gen_vec,
                                        position = pos,
                                        sequenceId = sessionSeqIdx session,
                                        logits = True })
                           writeIORef target_idx idx
 
-      obtain_logits ctx _batch = do target <- readIORef target_idx
-                                    logits <- getLogits ctx target
+      obtain_logits _ctx batch = do target <- readIORef target_idx
+                                    logits <- getLogits batch target
                                     atomically $ writeTVar (logitsTVar session) (Just logits)
 
   atomically $ do
@@ -489,24 +490,24 @@ applyWantedTokens session = do
   gen_vec <- readIORef (generatedTokens session)
   wanted_vec <- readIORef (wantedTokens session)
 
-  if | V.length gen_vec > V.length wanted_vec -> do
-         forgetTokens ctx seq_idx (V.length wanted_vec-1) (-1)
-         writeIORef (generatedTokens session) (V.take (V.length wanted_vec-1) gen_vec)
-         writeIORef (posRef session) (V.length wanted_vec-1)
+  if | VU.length gen_vec > VU.length wanted_vec -> do
+         forgetTokens ctx seq_idx (VU.length wanted_vec-1) (-1)
+         writeIORef (generatedTokens session) (VU.take (VU.length wanted_vec-1) gen_vec)
+         writeIORef (posRef session) (VU.length wanted_vec-1)
          applyWantedTokens session
 
      | otherwise -> do
          -- count common prefix length
          len <- commonPrefixLen gen_vec wanted_vec 0
-         if len == V.length wanted_vec
+         if len == VU.length wanted_vec
            then return ()  -- same prefixes
            else do forgetTokens ctx seq_idx len (-1)
-                   writeIORef (generatedTokens session) (V.take len gen_vec)
-                   decodeWantedTokens (V.drop len wanted_vec)
+                   writeIORef (generatedTokens session) (VU.take len gen_vec)
+                   decodeWantedTokens (VU.drop len wanted_vec)
  where
   commonPrefixLen gen_vec wanted_vec idx =
-     if V.length gen_vec > idx && V.length wanted_vec > idx &&
-        gen_vec V.! idx == wanted_vec V.! idx
+     if VU.length gen_vec > idx && VU.length wanted_vec > idx &&
+        gen_vec VU.! idx == wanted_vec VU.! idx
        then commonPrefixLen gen_vec wanted_vec (idx+1)
        else return idx
 
@@ -518,7 +519,7 @@ applyWantedTokens session = do
   decodeWantedTokens wanted_vec = do
     gen_vec <- readIORef (generatedTokens session)
 
-    let reset = writeIORef (posRef session) (V.length gen_vec)
+    let reset = writeIORef (posRef session) (VU.length gen_vec)
     reset
 
     target_ref <- newIORef 0
@@ -527,22 +528,22 @@ applyWantedTokens session = do
     let layer set_item = do pos <- readIORef (posRef session)
                             writeIORef (posRef session) (pos+1)
 
-                            let use_logits = pos - V.length gen_vec == V.length wanted_vec - 1
+                            let use_logits = pos - VU.length gen_vec == VU.length wanted_vec - 1
 
-                            idx <- set_item (BatchItem { token = wanted_vec V.! (pos - V.length gen_vec)
+                            idx <- set_item (BatchItem { token = wanted_vec VU.! (pos - VU.length gen_vec)
                                                        , position = pos
                                                        , sequenceId = seq_idx
                                                        , logits = use_logits })
 
                             writeIORef target_ref idx
 
-        obtain_logits ctx _batch = do target <- readIORef target_ref
-                                      logits <- getLogits ctx target
+        obtain_logits _ctx batch = do target <- readIORef target_ref
+                                      logits <- getLogits batch target
                                       atomically $ writeTVar (logitsTVar session) (Just logits)
 
     atomically $ do
       modifyTVar (cmCollectedWork manager) $ \seq ->
-        seq SQ.|> Predict seq_idx (V.length wanted_vec) layer obtain_logits reset
+        seq SQ.|> Predict seq_idx (VU.length wanted_vec) layer obtain_logits reset
     atomically $ readTVar (logitsTVar session) >>= \case
       Nothing -> retry
       Just _logits -> return ()
@@ -558,7 +559,7 @@ addText session text = liftIO $ do
   modifyIORef' (wantedTokens session) (<> new_tokens)
 
 -- | Adds tokens to the end of the current session.
-addTokens :: MonadIO m => Session -> Vector Token -> m ()
+addTokens :: MonadIO m => Session -> VU.Vector Token -> m ()
 addTokens session tokens = liftIO $ do
   modifyIORef' (wantedTokens session) (<> tokens)
 
@@ -566,7 +567,7 @@ addTokens session tokens = liftIO $ do
 resetText :: MonadIO m => Session -> m ()
 resetText session = liftIO $ do
   let bos = bosToken (cmContext $ sessionManager session)
-  writeIORef (wantedTokens session) (V.singleton bos)
+  writeIORef (wantedTokens session) (VU.singleton bos)
 
 -- | Mirostat sampling with tau = 4 and eta = 0.05
 mirostat4 :: MirostatConfig
