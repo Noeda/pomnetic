@@ -59,6 +59,7 @@ executable pomnetic-more-agents-is-all-you-need-experiment
         ,base >=4.9 && <5.0
         ,containers
         ,neat-interpolation
+        ,random
         ,pomnetic
         ,text
         ,vector
