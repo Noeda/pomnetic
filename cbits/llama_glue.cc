@@ -71,6 +71,38 @@ llama_context* hs_llama_create_context(llama_model* model, int n_batch, int n_ct
     ctx_params.n_ctx = n_ctx;
     ctx_params.n_threads = n_threads;
     ctx_params.n_threads_batch = n_threads_batch;
+    ctx_params.n_seq_max = 1;
+
+    /*
+     * uncomment for debugging
+     */
+
+    /*
+    printf("---\n");
+    printf("ctx_params.n_ctx = %d\n", ctx_params.n_ctx);
+    printf("ctx_params.n_seq_max = %d\n", ctx_params.n_seq_max);
+    printf("ctx_params.n_batch = %d\n", ctx_params.n_batch);
+    printf("ctx_params.n_ubatch = %d\n", ctx_params.n_ubatch);
+    printf("ctx_params.n_threads = %d\n", ctx_params.n_threads);
+    printf("ctx_params.n_threads_batch = %d\n", ctx_params.n_threads_batch);
+    printf("ctx_params.seed = %d\n", ctx_params.seed);
+    printf("ctx_params.logits_all = %d\n", ctx_params.logits_all);
+    printf("ctx_params.embeddings = %d\n", ctx_params.embeddings);
+    printf("ctx_params.rope_scaling_type = %d\n", ctx_params.rope_scaling_type);
+    printf("ctx_params.rope_freq_base = %f\n", ctx_params.rope_freq_base);
+    printf("ctx_params.rope_freq_scale = %f\n", ctx_params.rope_freq_scale);
+    printf("ctx_params.yarn_ext_factor = %f\n", ctx_params.yarn_ext_factor);
+    printf("ctx_params.yarn_attn_factor = %f\n", ctx_params.yarn_attn_factor);
+    printf("ctx_params.yarn_beta_fast = %f\n", ctx_params.yarn_beta_fast);
+    printf("ctx_params.yarn_beta_slow = %f\n", ctx_params.yarn_beta_slow);
+    printf("ctx_params.yarn_orig_ctx = %d\n", ctx_params.yarn_orig_ctx);
+    printf("ctx_params.pooling_type = %d\n", ctx_params.pooling_type);
+    printf("ctx_params.defrag_thold = %f\n", ctx_params.defrag_thold);
+    printf("ctx_params.cb_eval = %p\n", ctx_params.cb_eval);
+    printf("ctx_params.cb_eval_user_data = %p\n", ctx_params.cb_eval_user_data);
+    printf("ctx_params.offload_kqv = %d\n", ctx_params.offload_kqv);
+    printf("---\n");
+    */
 
     llama_context* ctx = llama_new_context_with_model(model, ctx_params);
     return ctx;
@@ -344,6 +376,13 @@ int hs_batch_has_logits(hs_batch* batch, int idx) {
     return batch->batch.logits[idx];
 }
 
+float* hs_get_logits_from_hs_batch_ptr(hs_batch* batch, int idx) {
+    assert(batch);
+    assert(batch->logits);
+    assert(batch->logits[idx]);
+    return batch->logits[idx];
+}
+
 void hs_get_logits_from_hs_batch(hs_batch* batch, int idx, float* logits) {
     assert(batch);
     assert(logits);
@@ -359,50 +398,122 @@ size_t hs_get_logits_len_from_hs_batch(hs_batch* batch, int idx) {
     return batch->logits_len[idx];
 }
 
+typedef struct hs_mirostat_state
+{
+    llama_token_data_array arr;
+    float* logits;
+    uint8_t* blacklist;
+    float mu;
+} hs_mirostat_state;
+
+hs_mirostat_state* hs_create_mirostat_state(void) {
+    hs_mirostat_state* state = (hs_mirostat_state*) calloc(1, sizeof(hs_mirostat_state));
+    if (!state) {
+        return 0;
+    }
+    return state;
+}
+
+void hs_set_mirostat_mu(hs_mirostat_state* state, float mu) {
+    assert(state);
+    state->mu = mu;
+}
+
+float hs_get_mirostat_mu(hs_mirostat_state* state) {
+    assert(state);
+    return state->mu;
+}
+
+void hs_free_mirostat_state(hs_mirostat_state* state) {
+    if (!state) {
+        return;
+    }
+    free(state->arr.data);
+    free(state->logits);
+    free(state->blacklist);
+    free(state);
+}
+
+int hs_make_mirostat_logits_size(hs_mirostat_state* state, size_t sz) {
+    float* new_logits = 0;
+    uint8_t* new_blacklist = 0;
+    llama_token_data* new_data = 0;
+
+    int ret_val = -1;
+    if (sz == 0) {
+        ret_val = 0;
+        goto freeall;
+    }
+    new_logits = (float*) realloc(state->logits, sz * sizeof(float));
+    if (!new_logits) {
+        goto freeall;
+    }
+    state->logits = new_logits;
+
+    new_blacklist = (uint8_t*) realloc(state->blacklist, sz * sizeof(uint8_t));
+    if (!new_blacklist) {
+        goto freeall;
+    }
+    state->blacklist = new_blacklist;
+
+    new_data = (llama_token_data*) realloc(state->arr.data, sz * sizeof(llama_token_data));
+    if (!new_data) {
+        goto freeall;
+    }
+    state->arr.data = new_data;
+
+    return 0;
+freeall:
+    free(state->logits);
+    free(state->arr.data);
+    free(state->blacklist);
+    state->logits = 0;
+    state->arr.data = 0;
+    state->blacklist = 0;
+    return ret_val;
+}
+
+float* hs_get_mirostat_logits(hs_mirostat_state* state) {
+    return state->logits;
+}
+
+uint8_t* hs_get_mirostat_blacklist(hs_mirostat_state* state) {
+    return state->blacklist;
+}
+
 int32_t hs_sample_mirostat(llama_context* ctx,
-                           float* logits,
-                           float* mu,
-                           uint8_t* blacklist,
+                           hs_mirostat_state* state,
                            float tau,
                            float eta) {
     assert(ctx);
-    assert(logits);
-    assert(mu);
+    assert(state->logits);
+    assert(state->blacklist);
+    assert(state->arr.data);
+
     // blacklist allowed to be NULL
-
-    llama_token_data_array arr;
-    memset(&arr, 0, sizeof(arr));
     int vocab_size = hs_get_vocab_size(ctx);
-    arr.data = (llama_token_data*) calloc(vocab_size, sizeof(llama_token_data));
-    if (!arr.data) {
-        fprintf(stderr, "Failed to allocate memory for token data array\n");
-        abort();
-    }
 
-    arr.size = 0;
-    arr.sorted = false;
+    state->arr.size = 0;
+    state->arr.sorted = false;
 
     int arr_cursor = 0;
     for (int i1 = 0; i1 < vocab_size; ++i1) {
-        if (blacklist && blacklist[i1]) {
+        if (state->blacklist && state->blacklist[i1]) {
             continue;
         }
-        arr.data[arr_cursor].id = i1;
-        arr.data[arr_cursor].logit = logits[i1];
-        arr.data[arr_cursor].p = 0.0;
+        state->arr.data[arr_cursor].id = i1;
+        state->arr.data[arr_cursor].logit = state->logits[i1];
+        state->arr.data[arr_cursor].p = 0.0;
         arr_cursor++;
-        arr.size++;
+        state->arr.size++;
     }
 
     if (arr_cursor == 0) {
-        free(arr.data);
         // everything was blacklisted
         return -1;
     }
 
-    int32_t result = llama_sample_token_mirostat_v2(ctx, &arr, tau, eta, mu);
-    free(arr.data);
-
+    int32_t result = llama_sample_token_mirostat_v2(ctx, &state->arr, tau, eta, &state->mu);
     return result;
 }
 

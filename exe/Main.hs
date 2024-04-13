@@ -8,10 +8,11 @@ import Control.Monad
 import Data.Attoparsec.ByteString
 import Data.Aeson.Parser
 import Data.Foldable
-import Data.IntMap.Strict (IntMap)
-import qualified Data.IntMap.Strict as IM
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as M
 import Data.Text
 import qualified Data.Text as T
+import Data.Traversable
 import qualified Data.Vector.Unboxed as VU
 import NeatInterpolation
 import Pomnetic
@@ -45,26 +46,44 @@ testPrompt = [trimming|
 921 * 771 =
 |]
 
-type Probability = Double
+data MAConfig = MAConfig
+  { numAgents :: !Int
+  , sampleLength :: !Int }
+
+generateMAText :: Session -> MAConfig -> IO ()
+generateMAText session maconfig = do
+  all_tokens <- wholeTokens session
+
+  completions <- for [0..numAgents maconfig-1] $ \agent_id -> do
+    putStrLn $ "Agent " ++ show agent_id ++ " is generating text..."
+
+    resetText session
+    addTokens session all_tokens
+
+    generateText session (generateConfig (sampleLength maconfig))
+    completion <- VU.drop (VU.length all_tokens) <$> wholeTokens session
+    return completion
+
+  print completions
+
+type Probability = Float
 
 -- | Given raw logits, returns a map of potential samples, with a simple
 -- "minimum 5% probability" thresholding.
---getPotentialSamples :: Logits -> IntMap Probability
---getPotentialSamples logits =
---  fg
+getPotentialSamples :: Logits -> Map Token Probability
+getPotentialSamples logits =
+  let sorted_logits = sortLogits logits
+      softmaxed_logits = softmaxLogits sorted_logits
+      filtered_logits = VU.filter (\(_, prob) -> prob > 0.05) softmaxed_logits
+      normalized_logits = normalizeLogits filtered_logits
+   in M.fromList $ VU.toList normalized_logits
 
 run :: FilePath -> IO ()
 run model_filepath = do
-  manager <- newManager model_filepath
-    (setAfterGenWaitMs 500 $
-     setStartGenAfterNWaiters 5 defaultManagerSettings)
+  manager <- newManager model_filepath defaultManagerSettings
 
   withSession manager $ \session -> do
     let model = sessionModel session
 
     addText session testPrompt
-    logits <- nextLogits session
-    let l = softmaxLogits $ sortLogits logits
-    VU.forM_ l $ \(idx, prob) -> do
-      let txt = tokensToText model (VU.singleton idx)
-      print (idx, prob, txt)
+    generateMAText session (MAConfig 20 100)

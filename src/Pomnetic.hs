@@ -56,6 +56,7 @@ module Pomnetic
   , sortLogits
   , tokensToText
   , intToToken
+  , Token
   , tokenToInt
   , vocabularySize
   -- ** Filters
@@ -87,6 +88,7 @@ import Data.Maybe ( fromJust )
 import qualified Data.Sequence as SQ
 import Data.Text ( Text )
 import qualified Data.Vector.Unboxed as VU
+import qualified Data.Vector.Unboxed.Mutable as VUM
 import GHC.Generics
 import Pomnetic.HuggingFaceTokenizers
 import Pomnetic.Medium
@@ -315,10 +317,11 @@ withSeqIdx manager action = mask $ \restore -> do
 -- | One session of text generation.
 data Session = Session
   { posRef :: !(IORef Int)
-  , sessionMu :: !(IORef Float)
+  , sessionMirostatState :: !MirostatState
   , generatedTokens :: !(IORef (VU.Vector Token))
   , wantedTokens :: !(IORef (VU.Vector Token))
-  , logitsTVar :: !(TVar (Maybe Logits))
+  , logitsMutable :: !(MLogits (VUM.PrimState IO))
+  , logitsReady :: !(TVar Bool)
   , sessionManager :: !Manager
   , sessionSeqIdx :: !Int }
 
@@ -332,15 +335,20 @@ sessionModel = cmModel . sessionManager
 -- the session.
 --
 -- Bad things may happen if you keep the `Session` value after `withSession` is
--- over. Only use it inside its own `withSession`.
+-- over. Only use it inside its own `withSession`. Also, forking and using
+-- session operations from different threads concurrently may lead to strange behavior; it's
+-- best to keep the session operations serialized or just in the same thread.
 withSession :: MonadIO m => Manager -> (Session -> IO a) -> m a
 withSession manager action = liftIO $ mask $ \restore -> withSeqIdx manager $ \seq_idx -> do
   forgetTokens (cmContext manager) seq_idx 0 (-1)
 
   pos_ref <- newIORef 0
 
-  mu_ref <- newIORef 8.0
-  logits_tvar <- newTVarIO Nothing
+  let vocab_size = vocabularySize (cmModel manager)
+
+  miro_state <- makeMirostatState 8.0
+  logits_mutable <- VUM.replicate vocab_size 0.0
+  logits_ready <- newTVarIO False
 
   let bos = bosToken (cmContext manager)
 
@@ -348,10 +356,11 @@ withSession manager action = liftIO $ mask $ \restore -> withSeqIdx manager $ \s
   wanted_ref <- newIORef $ VU.singleton bos
 
   let session = Session { posRef = pos_ref
-                        , sessionMu = mu_ref
+                        , sessionMirostatState = miro_state
                         , generatedTokens = gen_ref
                         , wantedTokens = wanted_ref
-                        , logitsTVar = logits_tvar
+                        , logitsMutable = logits_mutable
+                        , logitsReady = logits_ready
                         , sessionManager = manager
                         , sessionSeqIdx = seq_idx }
 
@@ -422,8 +431,7 @@ generateText session config = liftIO $ do
 nextLogits :: MonadIO m => Session -> m Logits
 nextLogits session = liftIO $ do
   applyWantedTokens session
-  logits <- fmap fromJust $ atomically $ readTVar (logitsTVar session)
-  return logits
+  VU.freeze (logitsMutable session)
 
 generateText2 :: Session -> GenerateConfig -> Int -> IO ()
 generateText2 _ config _ | numTokens config == 0 = return ()
@@ -435,19 +443,18 @@ generateText2 session config n_tokens_generated = liftIO $ do
 
   regex_filter_text <- textFrom session n_tokens_generated
 
-  logits <- fmap fromJust $ atomically $ readTVar (logitsTVar session)
+  -- unsafe because only used in sampleMirostat, and for reading
+  mirostat_logits <- VU.unsafeFreeze (logitsMutable session)
 
-  mu <- readIORef (sessionMu session)
-  (new_token, new_mu) <- case sampler config of
+  let miro_state = sessionMirostatState session
+  new_token <- case sampler config of
     Mirostat mirostat_config ->
       sampleMirostat (cmContext $ sessionManager session)
-                     logits
-                     mu
+                     mirostat_logits
+                     miro_state
                      (filters config)
                      mirostat_config
                      regex_filter_text
-
-  writeIORef (sessionMu session) new_mu
 
   modifyIORef' (generatedTokens session) $ \vec -> vec <> VU.singleton new_token
   modifyIORef' (wantedTokens session) $ \vec -> vec <> VU.singleton new_token
@@ -457,7 +464,7 @@ generateText2 session config n_tokens_generated = liftIO $ do
 
   target_idx <- newIORef 0
 
-  atomically $ writeTVar (logitsTVar session) Nothing
+  atomically $ writeTVar (logitsReady session) False
 
   let reset = writeIORef (posRef session) original_pos
 
@@ -472,16 +479,16 @@ generateText2 session config n_tokens_generated = liftIO $ do
                           writeIORef target_idx idx
 
       obtain_logits _ctx batch = do target <- readIORef target_idx
-                                    logits <- getLogits batch target
-                                    atomically $ writeTVar (logitsTVar session) (Just logits)
+                                    getLogitsMutable batch target (logitsMutable session)
+                                    atomically $ writeTVar (logitsReady session) True
 
   atomically $ do
     modifyTVar (cmCollectedWork manager) $ \seq ->
       seq SQ.|> Predict seq_idx 1 layer obtain_logits reset
 
-  atomically $ readTVar (logitsTVar session) >>= \case
-    Nothing -> retry
-    Just _logits -> return ()
+  atomically $ readTVar (logitsReady session) >>= \case
+    False -> retry
+    True -> return ()
 
   generateText2 session (config { numTokens = numTokens config - 1 }) n_tokens_generated
 
@@ -523,7 +530,7 @@ applyWantedTokens session = do
     reset
 
     target_ref <- newIORef 0
-    atomically $ writeTVar (logitsTVar session) Nothing
+    atomically $ writeTVar (logitsReady session) False
 
     let layer set_item = do pos <- readIORef (posRef session)
                             writeIORef (posRef session) (pos+1)
@@ -538,15 +545,15 @@ applyWantedTokens session = do
                             writeIORef target_ref idx
 
         obtain_logits _ctx batch = do target <- readIORef target_ref
-                                      logits <- getLogits batch target
-                                      atomically $ writeTVar (logitsTVar session) (Just logits)
+                                      getLogitsMutable batch target (logitsMutable session)
+                                      atomically $ writeTVar (logitsReady session) True
 
     atomically $ do
       modifyTVar (cmCollectedWork manager) $ \seq ->
         seq SQ.|> Predict seq_idx (VU.length wanted_vec) layer obtain_logits reset
-    atomically $ readTVar (logitsTVar session) >>= \case
-      Nothing -> retry
-      Just _logits -> return ()
+    atomically $ readTVar (logitsReady session) >>= \case
+      False -> retry
+      True -> return ()
 
     w <- readIORef $ wantedTokens session
     writeIORef (generatedTokens session) w

@@ -30,7 +30,8 @@
 -- come after that token.
 --
 -- Use `processBatch` to instruct the system to process the batch. Afterwards,
--- you can use `getLogits` to get probabilities for your tokens.
+-- you can use `getLogits` to get probabilities for your tokens. (or
+-- `getLogitsMutable`)
 --
 -- You can use `sampleMirostat` to sample a token from the logits. (or you can
 -- also do sampling yourself). For next generation, you could make a batch with
@@ -99,12 +100,18 @@ module Pomnetic.Medium
   , SeqID
   -- * Sampling
   , Logits
+  , MLogits
   , getLogits
+  , getLogitsMutable
   , SoftmaxLogitsable(..)
   , sortLogits
   -- ** Mirostat sampling
   , MirostatConfig(..)
   , mirostatConfig
+  , MirostatState()
+  , makeMirostatState
+  , cloneMirostatState
+  , mirostatMu
   , MirostatMu
   , sampleMirostat )
   where
@@ -123,7 +130,6 @@ import Data.Word
 import GHC.Generics
 import Foreign.C.String
 import Foreign.Marshal.Alloc
-import Foreign.Marshal.Array
 import Foreign.Marshal.Utils
 import Foreign.ForeignPtr
 import Foreign.Ptr
@@ -137,6 +143,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import Data.Unique
 import qualified Data.Vector.Unboxed as VU
+import qualified Data.Vector.Unboxed.Mutable as VUM
 import qualified Data.Vector.Algorithms.Heap as VUA
 import Pomnetic.Error
 import Pomnetic.HuggingFaceTokenizers
@@ -172,7 +179,6 @@ foreign import ccall "hs_create_batch" c_llama_create_batch :: CInt -> IO (Ptr C
 foreign import ccall "&hs_free_batch" fptr_c_llama_free_batch :: FunPtr (Ptr CBatch -> IO ())
 
 foreign import ccall unsafe "hs_batch_length" c_llama_batch_length :: Ptr CBatch -> IO CInt
-foreign import ccall unsafe "hs_batch_capacity" c_llama_batch_capacity :: Ptr CBatch -> IO CInt
 foreign import ccall unsafe "hs_set_batch_item" c_llama_set_batch_item
   :: Ptr CBatch
   -> CInt
@@ -184,14 +190,22 @@ foreign import ccall unsafe "hs_set_batch_item" c_llama_set_batch_item
 foreign import ccall unsafe "hs_set_batch_length" c_llama_set_batch_length :: Ptr CBatch -> CInt -> IO ()
 
 foreign import ccall "hs_decode" c_llama_decode :: Ptr CContext -> Ptr CBatch -> IO CInt
-foreign import ccall unsafe "hs_get_logits_from_hs_batch" c_llama_get_logits_from_hs_batch :: Ptr CBatch -> CInt -> Ptr CFloat -> IO ()
+foreign import ccall unsafe "hs_get_logits_from_hs_batch_ptr" c_llama_get_logits_from_hs_batch_ptr :: Ptr CBatch -> CInt -> IO (Ptr CFloat)
 foreign import ccall unsafe "hs_batch_has_logits" c_hs_batch_has_logits :: Ptr CBatch -> CInt -> IO CInt
 foreign import ccall unsafe "hs_get_logits_len_from_hs_batch" c_hs_get_logits_len_from_hs_batch :: Ptr CBatch -> CInt -> IO CSize
 foreign import ccall unsafe "hs_get_vocab_size" c_llama_vocab_size :: Ptr CContext -> IO CInt
 foreign import ccall unsafe "hs_get_vocab_size_model" c_llama_vocab_size_model :: Ptr CModel -> IO CInt
-foreign import ccall "hs_sample_mirostat" c_llama_sample_mirostat :: Ptr CContext -> Ptr CFloat -> Ptr CFloat -> Ptr Word8 -> CFloat -> CFloat -> IO Int32
+foreign import ccall "hs_sample_mirostat" c_llama_sample_mirostat :: Ptr CContext -> Ptr CMirostatState -> CFloat -> CFloat -> IO Int32
+foreign import ccall "hs_get_mirostat_logits" c_hs_get_mirostat_logits :: Ptr CMirostatState -> IO (Ptr CFloat)
+foreign import ccall "hs_get_mirostat_blacklist" c_hs_get_mirostat_blacklist :: Ptr CMirostatState -> IO (Ptr Word8)
+foreign import ccall "hs_make_mirostat_logits_size" c_hs_make_mirostat_logits_size :: Ptr CMirostatState -> CSize -> IO CInt
+foreign import ccall "hs_set_mirostat_mu" c_hs_set_mirostat_mu :: Ptr CMirostatState -> CFloat -> IO ()
+foreign import ccall "hs_get_mirostat_mu" c_hs_get_mirostat_mu :: Ptr CMirostatState -> IO CFloat
 
 foreign import ccall "hs_remove_tokens" c_llama_remove_tokens :: Ptr CContext -> CInt -> CInt -> CInt -> IO ()
+
+foreign import ccall "hs_create_mirostat_state" c_llama_create_mirostat_state :: IO (Ptr CMirostatState)
+foreign import ccall "&hs_free_mirostat_state" fptr_c_llama_free_mirostat_state :: FunPtr (Ptr CMirostatState -> IO ())
 
 vocabularySize :: Model -> Int
 vocabularySize model = unsafePerformIO $ withModel model $ \model_ptr -> do
@@ -211,6 +225,7 @@ instance Show Batch where
   show (Batch uniq sz _) = "<#Batch " <> show (hashUnique uniq) <> " " <> show sz <> ">"
 
 data CContext
+data CMirostatState
 data CModel
 data CBatch
 
@@ -432,7 +447,7 @@ data BatchItem = BatchItem
 -- Use `getLogits` to get the logits of a batch, with index matching which
 -- index you used in `setBatchItem`.
 processBatch :: MonadIO m => Context -> Batch -> m ()
-processBatch ctx batch@(Batch _ batch_capacity batch_mvar) = liftIO $ do
+processBatch ctx (Batch _ _ batch_mvar) = liftIO $ do
   withMVar batch_mvar $ \batch_fptr -> withForeignPtr batch_fptr $ \batch_ptr -> do
     withContext ctx $ \ctx_ptr -> do
       result <- c_llama_decode ctx_ptr batch_ptr
@@ -460,7 +475,7 @@ forgetTokens ctx seq_id start end = liftIO $ withContext ctx $ \ctx_ptr ->
 type BatchItemIdx = Int
 
 setBatchItem :: Batch -> BatchItem -> BatchItemIdx -> IO ()
-setBatchItem batch@(Batch _ len mvar) item sz =
+setBatchItem (Batch _ len mvar) item sz =
   if sz >= len
     then pomneticError $ "Batch size must be less than " <> show len
     else withMVar mvar $ \fptr_batch -> withForeignPtr fptr_batch $ \batch_ptr ->
@@ -473,9 +488,6 @@ setBatchItem batch@(Batch _ len mvar) item sz =
                                  (if logits item
                                    then 1
                                    else 0)
-
-batchCapacity :: Batch -> Int
-batchCapacity (Batch _ capacity _) = capacity
 
 batchLength :: MonadIO m => Batch -> m Int
 batchLength (Batch _ _ mvar) = liftIO $ withMVar mvar $ \fptr -> withForeignPtr fptr $ \ptr ->
@@ -492,6 +504,7 @@ vocabSize :: Context -> Int
 vocabSize (Context _ _ vocab_size) = vocab_size
 
 type Logits = VU.Vector Float
+type MLogits s = VUM.MVector s Float
 
 -- | Gets logits for a batch item. The integer refers to the index as used in
 -- the last argument of `setBatchItem`.
@@ -506,10 +519,47 @@ getLogits (Batch _ _ mvar) idx = liftIO $ withMVar mvar $ \fbatch_ptr -> withFor
 
   vocab_size <- safeFromIntegral <$> c_hs_get_logits_len_from_hs_batch batch_ptr (safeFromIntegral idx)
 
-  allocaArray vocab_size $ \logits_ptr -> do
-    --c_llama_get_logits ctx_ptr (safeFromIntegral idx) logits_ptr
-    c_llama_get_logits_from_hs_batch batch_ptr (safeFromIntegral idx) logits_ptr
-    VU.fromList . fmap cfloatToFloat <$> peekArray vocab_size logits_ptr
+  logits_ptr <- c_llama_get_logits_from_hs_batch_ptr batch_ptr (safeFromIntegral idx)
+
+  result <- VUM.new vocab_size
+  fill logits_ptr result
+  VU.unsafeFreeze result
+ where
+  fill :: Ptr CFloat -> VUM.IOVector Float -> IO ()
+  fill logits_ptr result_vec = go 0 (VUM.length result_vec)
+    where
+      go !i !len | i >= len = return ()
+      go !i !len = do
+        !x <- peekElemOff logits_ptr i
+        VUM.unsafeWrite result_vec i (cfloatToFloat x)
+        go (i + 1) len
+
+-- | Same as `getLogits` but modifies an already allocated mutable vector. The
+-- vector must have the same size as the vocabulary.
+getLogitsMutable :: MonadIO m => Batch -> BatchItemIdx -> MLogits (VUM.PrimState IO) -> m ()
+getLogitsMutable (Batch _ _ mvar) idx mlogits = liftIO $ withMVar mvar $ \fbatch_ptr -> withForeignPtr fbatch_ptr $ \batch_ptr -> do
+  -- c_hs_batch_has_logits checks for range too; returns zero if no logits
+  has_logits <- c_hs_batch_has_logits batch_ptr (safeFromIntegral idx)
+  when (has_logits == 0) $
+    throwIO BatchItemIdxHasNoLogits
+
+  vocab_size <- safeFromIntegral <$> c_hs_get_logits_len_from_hs_batch batch_ptr (safeFromIntegral idx)
+  when (vocab_size /= VUM.length mlogits) $
+    pomneticError "Mutable logits vector size does not match vocabulary size"
+
+  logits_ptr <- c_llama_get_logits_from_hs_batch_ptr batch_ptr (safeFromIntegral idx)
+
+  fill logits_ptr mlogits
+ where
+  fill :: Ptr CFloat -> VUM.IOVector Float -> IO ()
+  fill logits_ptr result_vec = go 0 (VUM.length result_vec)
+    where
+      go !i !len | i >= len = return ()
+      go !i !len = do
+        !x <- peekElemOff logits_ptr i
+        VUM.unsafeWrite result_vec i (cfloatToFloat x)
+        go (i + 1) len
+
 
 -- | A utility function to take `Logits`, sort them, and return the sorted
 -- `Logits`. The sorted list contains an index that determines the token ID.
@@ -523,20 +573,34 @@ sortLogits logits = unsafePerformIO $ do
   VU.unsafeFreeze thawed
 
 class SoftmaxLogitsable a where
+  -- | A utility function to take `Logits` and convert them to probabilities.
+  --
+  -- Does this operation: `exp(logits) / sum(exp(logits))` (with the exp accuracy
+  -- numerical trick of subtracting the maximum value from the logits).
   softmaxLogits :: a -> a
+
+  -- | A utility function to normalize logits to probabilities, so they sum up
+  -- to 1. Can be used after e.g. filtering out some logits and maintaining the
+  -- relative probabilities and still summing up to 1.
+  --
+  -- Expects every value to be zero or greater. So don't use on raw logits that
+  -- might be negative.
+  normalizeLogits :: a -> a
 
 instance SoftmaxLogitsable Logits where
   {-# INLINE softmaxLogits #-}
   softmaxLogits = softmaxLogitsLogits
 
+  {-# INLINE normalizeLogits #-}
+  normalizeLogits = normalizeLogitsLogits
+
 instance SoftmaxLogitsable (VU.Vector (Token, Float)) where
   {-# INLINE softmaxLogits #-}
   softmaxLogits = softmaxLogitsTokenFloat
 
--- | A utility function to take `Logits` and convert them to probabilities.
---
--- Does this operation: `exp(logits) / sum(exp(logits))` (with the exp accuracy
--- numerical trick of subtracting the maximum value from the logits).
+  {-# INLINE normalizeLogits #-}
+  normalizeLogits = normalizeLogitsTokenFloat
+
 softmaxLogitsLogits :: Logits -> Logits
 softmaxLogitsLogits logits | VU.null logits = VU.empty
 softmaxLogitsLogits logits | VU.length logits == 1 = VU.singleton 1.0
@@ -557,6 +621,18 @@ softmaxLogitsTokenFloat logits =
       exps = VU.map (\(tk, x) -> (tk, exp (x - snd max_value))) logits
       sum_exps = dvdSum $ VU.map snd exps
    in VU.map (\(tk, x) -> (tk, x / sum_exps)) exps
+
+normalizeLogitsLogits :: Logits -> Logits
+normalizeLogitsLogits logits | VU.null logits = VU.empty
+normalizeLogitsLogits logits =
+  let sum_logits = dvdSum logits
+   in VU.map (/ sum_logits) logits
+
+normalizeLogitsTokenFloat :: VU.Vector (Token, Float) -> VU.Vector (Token, Float)
+normalizeLogitsTokenFloat logits | VU.null logits = VU.empty
+normalizeLogitsTokenFloat logits =
+  let sum_logits = dvdSum $ VU.map snd logits
+   in VU.map (\(tk, x) -> (tk, x / sum_logits)) logits
 
 {-# INLINE dvdSum #-}
 dvdSum :: (VU.Unbox a, Num a) => VU.Vector a -> a
@@ -648,42 +724,88 @@ data MirostatConfig = MirostatConfig
 mirostatConfig :: Float -> Float -> MirostatConfig
 mirostatConfig tau eta = MirostatConfig tau eta
 
-sampleMirostat :: MonadIO m => Context -> Logits -> MirostatMu -> Filters -> MirostatConfig -> RegexFilterText -> m (Token, MirostatMu)
-sampleMirostat ctx logits _mu _filters _config _regex_filter_text | VU.length logits /= vocabSize ctx =
+newtype MirostatState = MirostatState
+  { mirostatCStore :: MVar (ForeignPtr CMirostatState) }
+
+makeMirostatState :: MonadIO m => MirostatMu -> m MirostatState
+makeMirostatState mu = liftIO $ mask_ $ do
+  st <- c_llama_create_mirostat_state
+  when (st == nullPtr) $
+    pomneticError "Failed to create mirostat state"
+
+  c_hs_set_mirostat_mu st (CFloat mu)
+
+  fptr <- newForeignPtr fptr_c_llama_free_mirostat_state st
+  mvar <- newMVar fptr
+
+  return MirostatState { mirostatCStore = mvar }
+
+cloneMirostatState :: MonadIO m => MirostatState -> m MirostatState
+cloneMirostatState mstate = liftIO $ withMVar (mirostatCStore mstate) $ \mstate_fptr -> withForeignPtr mstate_fptr $ \mstate_ptr -> do
+  st <- c_llama_create_mirostat_state
+  when (st == nullPtr) $
+    pomneticError "Failed to create mirostat state"
+
+  mu <- c_hs_get_mirostat_mu mstate_ptr
+  c_hs_set_mirostat_mu st mu
+
+  fptr <- newForeignPtr fptr_c_llama_free_mirostat_state st
+  mvar <- newMVar fptr
+
+  return MirostatState { mirostatCStore = mvar }
+
+mirostatMu :: MonadIO m => MirostatState -> m MirostatMu
+mirostatMu mstate = liftIO $ withMVar (mirostatCStore mstate) $ \mstate_fptr -> withForeignPtr mstate_fptr $ \mstate_ptr -> do
+  mu <- c_hs_get_mirostat_mu mstate_ptr
+  return $ cfloatToFloat mu
+
+sampleMirostat :: MonadIO m => Context -> Logits -> MirostatState -> Filters -> MirostatConfig -> RegexFilterText -> m Token
+sampleMirostat ctx logits _mstate _filters _config _regex_filter_text | VU.length logits /= vocabSize ctx =
   pomneticError "Logits size must be equal to vocab size"
-sampleMirostat ctx@(Context _ model vocab_size) logits mu filters config regex_filter_text = liftIO $ withContext ctx $ \ctx_ptr ->
-  allocaArray (VU.length logits) $ \logits_ptr -> do
-    pokeArray logits_ptr (fmap realToFrac $ VU.toList logits)
-    alloca $ \mu_ptr -> do
-      allocaArray (VU.length logits) $ \blacklist_ptr -> do
-        test_fun <- fillBlacklist filters blacklist_ptr vocab_size model regex_filter_text
+sampleMirostat ctx@(Context _ model vocab_size) logits mstate filters config regex_filter_text = liftIO $
+  withMVar (mirostatCStore mstate) $ \mstate_fptr -> withForeignPtr mstate_fptr $ \mstate_ptr -> do
+    withContext ctx $ \ctx_ptr -> do
+      result <- c_hs_make_mirostat_logits_size mstate_ptr (safeFromIntegral $ VU.length logits)
+      when (result /= 0) $
+        pomneticError "Failed to make mirostat logits"
+      mirostat_logits_ptr <- c_hs_get_mirostat_logits mstate_ptr
+      blacklist_ptr <- c_hs_get_mirostat_blacklist mstate_ptr
 
-        let sample_token = do poke mu_ptr (CFloat mu)
-                              token_idx <- c_llama_sample_mirostat
-                                ctx_ptr
-                                logits_ptr
-                                mu_ptr
-                                blacklist_ptr
-                                (CFloat (mirostatTau config))
-                                (CFloat (mirostatEta config))
+      fillMirostatLogitsPtr mirostat_logits_ptr logits
 
-                              when (token_idx == -1) $
-                                throwIO AllTokensRejected
+      test_fun <- fillBlacklist filters blacklist_ptr vocab_size model regex_filter_text
 
-                              new_mu <- cfloatToFloat <$> peek mu_ptr
-                              return (token_idx, new_mu)
+      let sample_token = do token_idx <- c_llama_sample_mirostat
+                              ctx_ptr
+                              mstate_ptr
+                              (CFloat (mirostatTau config))
+                              (CFloat (mirostatEta config))
 
-            try_loop = do (token_idx, new_mu) <- sample_token
-                          let token = Token $ safeFromIntegral token_idx
-                          accepted <- test_fun token
-                          if accepted
-                            then return (token, new_mu)
-                            else do pokeElemOff blacklist_ptr (safeFromIntegral token_idx) 1
-                                    try_loop
+                            when (token_idx == -1) $
+                              throwIO AllTokensRejected
 
-        (token, new_mu) <- try_loop
-        return (token, new_mu)
+                            return token_idx
 
+          try_loop = do token_idx <- sample_token
+                        let token = Token $ safeFromIntegral token_idx
+                        accepted <- test_fun token
+                        if accepted
+                          then return token
+                          else do pokeElemOff blacklist_ptr (safeFromIntegral token_idx) 1
+                                  try_loop
+
+      token <- try_loop
+      return token
+ where
+  fillMirostatLogitsPtr :: Ptr CFloat -> Logits -> IO ()
+  fillMirostatLogitsPtr !mirostat_logits_ptr !logits = go 0 (VU.length logits)
+   where
+    go !idx !len | idx >= len = return ()
+    go !idx !len = do
+      pokeElemOff mirostat_logits_ptr idx (realToFrac $ VU.unsafeIndex logits idx)
+      go (idx + 1) len
+
+{-# NOINLINE fillBlacklist #-}
 fillBlacklist :: Filters -> Ptr Word8 -> Int -> Model -> RegexFilterText -> IO (Token -> IO Bool)
 fillBlacklist filters ptr vocab_size model regex_filter_text = do
   fillBytes ptr 0 vocab_size
@@ -754,8 +876,9 @@ fillBlacklist filters ptr vocab_size model regex_filter_text = do
 
     return [f3_fun]
 
+{-# INLINE cfloatToFloat #-}
 cfloatToFloat :: CFloat -> Float
-cfloatToFloat = realToFrac
+cfloatToFloat !x = realToFrac x
 
 -- | Tokenizes a text. Does not add special tokens (like bos or eos).
 tokenize :: Model -> Text -> VU.Vector Token
