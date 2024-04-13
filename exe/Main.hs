@@ -97,11 +97,11 @@ generateMAToken session maconfig = do
   all_tokens <- wholeTokens session
   completions <- go all_tokens (numAgents maconfig) (sampleLength maconfig)
 
-  let chosen = similarityFromGroup completions
+  let chosen = similarityFromGroup $ fmap (\completion -> VU.drop (VU.length all_tokens) completion) completions
 
   resetText session
   addTokens session all_tokens
-  addTokens session (VU.singleton (VU.head $ VU.drop (VU.length all_tokens) chosen))
+  addTokens session (VU.singleton (VU.head chosen))
  where
   go :: VU.Vector Token -> Int -> Int -> IO [VU.Vector Token]
   go all_tokens nagents nsamples = do
@@ -170,7 +170,7 @@ run model_filepath = do
   withSession manager $ \session -> do
     addText session testPrompt
     replicateM_ 1000 $ do
-      generateMAToken session (MAConfig 10 20)
+      generateMAToken session (MAConfig 3 20)
       txt <- wholeText session
       putStrLn $ "Text so far:"
       putStrLn $ T.unpack txt
